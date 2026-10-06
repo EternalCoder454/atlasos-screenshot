@@ -1,0 +1,28 @@
+# ~/.config/atlasos-screenshot/config.toml
+# Every key is optional; these are the defaults. Unknown keys or bad values
+# make the tool use the defaults and print one warning.
+
+[capture]
+# Draw the pointer into the screenshot.
+include_cursor = false
+
+[overlay]
+# How dark the screen gets around the selection, 0.0 to 0.9.
+dim = 0.45
+# Selection border colour (Atlas.Ui's accent).
+accent = "#8A7AF4"
+
+[redact]
+# What Alt+drag covers.
+emails = true
+ipv4 = true
+ipv6 = true
+mac = true
+# Colour of the boxes, and extra pixels around each.
+fill = "#000000"
+padding = 2
+
+[output]
+# Also save every image (plain and Alt drags) here as a PNG. Absolute path.
+# Unset (the default): nothing is ever written to disk.
+# save_dir = "/home/you/Pictures/Screenshots"
