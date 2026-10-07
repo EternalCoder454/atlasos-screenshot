@@ -1,13 +1,15 @@
 #!/bin/bash
-# Runs inside the AtlasOS image for scripts/e2e-kwin.sh. Not for the host.
+# Runs inside the Telamon OS image for scripts/e2e-kwin.sh. Not for the host.
 set -uo pipefail
 
 log=/out/e2e-$E2E_PART.log
 exec > >(tee -a "$log") 2>&1
 
 if [ "${1:-}" != --in-session ]; then
-    install -m755 /in/atlasos-screenshot /usr/bin/atlasos-screenshot
-    install -m644 /in/data/net.eterneon.atlas.screenshot.desktop /usr/share/applications/
+    install -m755 /in/telamon-screenshot /usr/bin/telamon-screenshot
+    # The old name, as the package ships it for this release.
+    ln -s telamon-screenshot /usr/bin/atlasos-screenshot
+    install -m644 /in/data/net.eterneon.telamon.screenshot.desktop /usr/share/applications/
     # kwin_wayland has file caps, which a rootless container can't honour;
     # a copy (keeping its name, or its QPA plugin refuses) runs without.
     mkdir -p /tmp/b && cp /usr/sbin/kwin_wayland /tmp/b/kwin_wayland
@@ -28,7 +30,7 @@ check() { # name, condition result
 }
 png_size() { python3 -c 'import struct,sys; d=open(sys.argv[1],"rb").read(24); print("%dx%d" % struct.unpack(">II", d[16:24]))' "$1"; }
 ms() { echo $(($(date +%s%N) / 1000000)); }
-servers() { pgrep -f '^/usr/bin/atlasos-screenshot|^atlasos-screenshot' | tr '\n' ' '; }
+servers() { pgrep -f '^/usr/bin/telamon-screenshot|^telamon-screenshot' | tr '\n' ' '; }
 
 # 1920x1200 pixels at 1.5x: a 1280x800 logical desktop, like the user's.
 # (kwin's own --scale multiplies the size instead.)
@@ -41,8 +43,28 @@ sleep 1
 kdialog --title "E2E" --msgbox "Mail zach@example.com from 192.168.1.20 now" >/dev/null 2>&1 &
 sleep 4
 
-S=atlasos-screenshot
+S=telamon-screenshot
 if [ "$E2E_PART" = online ]; then
+    # The old name (a link) is granted ScreenShot2 too: KWin goes by the real path.
+    atlasos-screenshot --region 0,0,640x400; rc=$?
+    check "old name: atlasos-screenshot (link) still copies through ScreenShot2" $rc
+    wl-paste -t image/png >/out/oldname.png
+    check "old name: clipboard has a 960x600 PNG" $([ "$(png_size /out/oldname.png)" = 960x600 ]; echo $?)
+    wl-copy other
+    sleep 1
+
+    # Files of atlasos-screenshot (before 0.2.0) move on the first run.
+    mkdir -p "$XDG_CONFIG_HOME/atlasos-screenshot"
+    printf '[overlay]\ndim = 0.2\n' >"$XDG_CONFIG_HOME/atlasos-screenshot/config.toml"
+    $S --region 0,0,100x100 2>/tmp/mig.txt; rc=$?
+    check "migration: runs with the old config folder" $rc
+    check "migration: config moved to telamon-screenshot" \
+        $([ -f "$XDG_CONFIG_HOME/telamon-screenshot/config.toml" ] && [ ! -e "$XDG_CONFIG_HOME/atlasos-screenshot" ]; echo $?)
+    check "migration: the moved config is valid (no warning)" $([ ! -s /tmp/mig.txt ]; echo $?)
+    rm -r "$XDG_CONFIG_HOME/telamon-screenshot"
+    wl-copy other
+    sleep 1
+
     t0=$(ms)
     $S --region 0,0,1280x800; rc=$?
     t1=$(ms)
@@ -65,7 +87,13 @@ if [ "$E2E_PART" = online ]; then
     wl-paste -t text/plain >/out/text.txt
     echo "--- OCR text"; cat /out/text.txt; echo "---"
     check "text: OCR found the address" $(grep -qE '192\.168\.1[. ]20' /out/text.txt; echo $?)
-    ls -la "$XDG_DATA_HOME/atlasos-screenshot" "$XDG_DATA_HOME/atlasos-screenshot/models"
+    ls -la "$XDG_DATA_HOME/telamon-screenshot" "$XDG_DATA_HOME/telamon-screenshot/models"
+    # Models of the old folder name move, and are used without a download.
+    mv "$XDG_DATA_HOME/telamon-screenshot" "$XDG_DATA_HOME/atlasos-screenshot"
+    $S --mode text --region 0,0,1280x800 2>/tmp/mig2.txt; rc=$?
+    check "migration: text works from the old models folder" $rc
+    check "migration: models moved, not downloaded again" \
+        $([ -f "$XDG_DATA_HOME/telamon-screenshot/models/text-detection.rten" ] && [ ! -e "$XDG_DATA_HOME/atlasos-screenshot" ] && ! grep -qi download /tmp/mig2.txt; echo $?)
     t0=$(ms)
     $S --mode text --region 0,0,1280x800 && t1=$(ms) && echo "text: warm $((t1 - t0)) ms"
 
@@ -74,18 +102,18 @@ if [ "$E2E_PART" = online ]; then
     wl-paste -t image/png >/out/redact.png
 
     # Damage a model: it must be re-downloaded, not used.
-    printf 'x' | dd of="$XDG_DATA_HOME/atlasos-screenshot/models/text-detection.rten" bs=1 seek=100 conv=notrunc 2>/dev/null
+    printf 'x' | dd of="$XDG_DATA_HOME/telamon-screenshot/models/text-detection.rten" bs=1 seek=100 conv=notrunc 2>/dev/null
     $S --mode text --region 0,0,1280x800; rc=$?
     check "text: damaged model is replaced" $rc
 
     # Bad config: defaults plus one warning, still works.
-    mkdir -p "$XDG_CONFIG_HOME/atlasos-screenshot"
-    printf '[overlay]\ndim = 7\n' >"$XDG_CONFIG_HOME/atlasos-screenshot/config.toml"
+    mkdir -p "$XDG_CONFIG_HOME/telamon-screenshot"
+    printf '[overlay]\ndim = 7\n' >"$XDG_CONFIG_HOME/telamon-screenshot/config.toml"
     $S --region 0,0,100x100 2>/tmp/warn.txt; rc=$?
     cat /tmp/warn.txt
     check "bad config: still copies" $rc
     check "bad config: one warning" $([ "$(grep -c overlay.dim /tmp/warn.txt)" = 1 ]; echo $?)
-    rm "$XDG_CONFIG_HOME/atlasos-screenshot/config.toml"
+    rm "$XDG_CONFIG_HOME/telamon-screenshot/config.toml"
 
     # The overlay: start it, then capture the screen with it up.
     $S &
@@ -114,7 +142,7 @@ else
         $([ -z "$(find "$XDG_DATA_HOME" -name '*.tmp' 2>/dev/null)" ]; echo $?)
 fi
 
-pkill -f atlasos-screenshot
+pkill -f telamon-screenshot
 kill $kwin
 echo "$E2E_PART: $fails failure(s)"
 exit $fails

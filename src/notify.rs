@@ -9,13 +9,13 @@ use std::time::Duration;
 
 use zbus::zvariant::Value;
 
-const APP: &str = "AtlasOS Screenshot";
+const APP: &str = "Telamon Screenshot";
 const ICON: &str = "applets-screenshooter";
 
 /// Prints `text` and shows it as a normal-urgency notification.
 pub fn show(text: &str) {
     // Not eprintln!: it panics when stderr is closed.
-    let _ = writeln!(std::io::stderr(), "atlasos-screenshot: {text}");
+    let _ = writeln!(std::io::stderr(), "telamon-screenshot: {text}");
     let mut chars = text.chars();
     let body: String = chars
         .next()
@@ -47,7 +47,7 @@ fn send(body: &str) {
     hints.insert("urgency", Value::from(1u8));
     hints.insert(
         "desktop-entry",
-        Value::from("net.eterneon.atlas.screenshot"),
+        Value::from("net.eterneon.telamon.screenshot"),
     );
     let _ = conn.call_method(
         Some("org.freedesktop.Notifications"),

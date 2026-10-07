@@ -106,4 +106,4 @@ impl Ocr {
 }
 
 #[cfg(not(feature = "ocr"))]
-pub const NO_OCR: &str = "this build of atlasos-screenshot has no text recognition";
+pub const NO_OCR: &str = "this build of telamon-screenshot has no text recognition";

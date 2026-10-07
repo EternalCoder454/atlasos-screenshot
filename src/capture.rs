@@ -3,7 +3,7 @@
 //! so all backends behave the same.
 //!
 //! Backends, in order (the first one available wins):
-//! 1. KWin's `org.kde.KWin.ScreenShot2` over D-Bus (AtlasOS). Restricted to
+//! 1. KWin's `org.kde.KWin.ScreenShot2` over D-Bus (Telamon OS). Restricted to
 //!    binaries named by an installed `.desktop` file with
 //!    `X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2`.
 //! 2. `ext-image-copy-capture-v1`, one capture per output.

@@ -1,4 +1,4 @@
-//! `~/.config/atlasos-screenshot/config.toml`.
+//! `~/.config/telamon-screenshot/config.toml`.
 //!
 //! The file is untrusted input: it is size-capped, unknown keys are refused,
 //! and every value is range-checked. A missing file gives the defaults
@@ -9,6 +9,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+
+use crate::legacy;
 
 /// A config file this large is not a config file.
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
@@ -34,7 +36,7 @@ pub struct CaptureConfig {
 pub struct OverlayConfig {
     /// How dark the area outside the selection gets, 0.0 to 0.9.
     pub dim: f32,
-    /// Selection border, `#RRGGBB`. Atlas.Ui's dark accent by default.
+    /// Selection border, `#RRGGBB`. Telamon.Ui's dark accent by default.
     pub accent: String,
 }
 
@@ -126,21 +128,40 @@ impl Config {
     }
 }
 
-/// `$XDG_CONFIG_HOME/atlasos-screenshot/config.toml`, else under `~/.config`.
-pub fn default_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
+/// `$XDG_CONFIG_HOME`, else `~/.config`.
+fn config_base() -> Option<PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("atlasos-screenshot").join("config.toml"))
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
 }
 
-/// Loads the config. Never fails: problems come back as the warning to print.
+fn path_in(base: &Path, folder: &str) -> PathBuf {
+    base.join(folder).join("config.toml")
+}
+
+/// Loads `$XDG_CONFIG_HOME/telamon-screenshot/config.toml` (else under
+/// `~/.config`). Never fails: problems come back as the warning to print.
+/// A folder left by `atlasos-screenshot` (before 0.2.0) is moved to the new
+/// name first, once; if it can't be moved (a read-only home), its file is
+/// read where it is.
 pub fn load() -> (Config, Option<String>) {
-    match default_path() {
-        Some(path) => load_from(&path),
-        None => (Config::default(), None),
+    let Some(base) = config_base() else {
+        return (Config::default(), None);
+    };
+    load_migrating(&base)
+}
+
+fn load_migrating(base: &Path) -> (Config, Option<String>) {
+    let new = path_in(base, legacy::NAME);
+    let moved = legacy::move_once(base, false);
+    if moved.is_err() && new.symlink_metadata().is_err() {
+        let old = path_in(base, legacy::OLD_NAME);
+        if old.symlink_metadata().is_ok() {
+            return load_from(&old);
+        }
     }
+    load_from(&new)
 }
 
 pub fn load_from(path: &Path) -> (Config, Option<String>) {
@@ -235,8 +256,31 @@ mod tests {
     }
 
     #[test]
+    fn config_of_the_old_name_moves_once_and_is_read() {
+        let base =
+            std::env::temp_dir().join(format!("telamon-screenshot-cfgmv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let old = base.join(legacy::OLD_NAME);
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("config.toml"), "[overlay]\naccent = \"#123456\"\n").unwrap();
+
+        let (cfg, warn) = load_migrating(&base);
+        assert!(warn.is_none(), "{warn:?}");
+        assert_eq!(cfg.overlay.accent, "#123456");
+        assert!(!old.exists(), "the old folder is gone");
+        assert!(path_in(&base, legacy::NAME).is_file());
+        // Once: a later run reads the new place, and a recreated old folder is left alone.
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("config.toml"), "[overlay]\naccent = \"#654321\"\n").unwrap();
+        let (cfg, _) = load_migrating(&base);
+        assert_eq!(cfg.overlay.accent, "#123456");
+        assert!(old.join("config.toml").is_file());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
     fn missing_file_is_silent_defaults() {
-        let (cfg, warn) = load_from(Path::new("/nonexistent/atlasos-screenshot/config.toml"));
+        let (cfg, warn) = load_from(Path::new("/nonexistent/telamon-screenshot/config.toml"));
         assert_eq!(cfg, Config::default());
         assert!(warn.is_none());
     }
@@ -244,7 +288,7 @@ mod tests {
     #[test]
     fn unreadable_or_bad_file_warns_once() {
         let dir =
-            std::env::temp_dir().join(format!("atlasos-screenshot-cfg-{}", std::process::id()));
+            std::env::temp_dir().join(format!("telamon-screenshot-cfg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // A directory where the file should be.
         let (cfg, warn) = load_from(&dir);

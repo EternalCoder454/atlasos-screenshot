@@ -1,6 +1,6 @@
 //! The selection overlay: one wlr-layer-shell surface per output, showing the
 //! frozen frame dimmed, with the selection undimmed inside a rounded border
-//! in the Atlas accent. No toolkit; SHM buffers drawn by hand (`paint`).
+//! in the Telamon accent. No toolkit; SHM buffers drawn by hand (`paint`).
 //!
 //! - Drag with the left button to select; release to finish. The modifiers
 //!   held at release pick the mode (Ctrl: text, Alt: redact).
@@ -229,7 +229,7 @@ impl Overlay {
                 qh,
                 surface,
                 Layer::Overlay,
-                Some("atlasos-screenshot"),
+                Some("telamon-screenshot"),
                 Some(&output),
             );
             layer.set_anchor(Anchor::all());
