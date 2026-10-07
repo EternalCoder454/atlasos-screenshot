@@ -388,13 +388,17 @@ case "$1" in -) out=/out/editor-real-stdin.png ;; "") out=/out/editor-real-empty
 exec /in/editor-test --screenshot "$out" --wait 1500 "$@"
 WRAP
         rm -f /out/editor-real-*.png
+        # Quit and gone from the screen before the next picture is taken.
+        editor_gone() { waitfor 15 test -z "$(pgrep -f '^/in/editor-test')"; sleep 1.5; }
         /usr/bin/telamon-screenshot-editor >/dev/null 2>&1 &
         waitfor 30 test -s /out/editor-real-empty.png
         check "editor: opens empty, in this session" $?
+        editor_gone
         $S --region 0,0,640x400 --edit --no-save --no-notify >/dev/null; rc=$?
         check "editor, stdin round trip: --region --edit --no-save exits 0 at once" $rc
         waitfor 30 test -s /out/editor-real-stdin.png
         check "editor, stdin round trip: the editor opened and drew its window" $?
+        editor_gone
         f=$($S --region 0,0,640x400 --edit --no-notify); rc=$?
         waitfor 30 test -s /out/editor-real-file.png
         check "editor, file: --region --edit opens the saved file" $?
