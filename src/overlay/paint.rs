@@ -64,35 +64,97 @@ impl Rects {
     }
 }
 
+/// Where logical coordinates land in a screen's buffer:
+/// `x_buf = (x - lx) * sx - ox`, likewise for y.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Map {
+    lx: i32,
+    ly: i32,
+    sx: f64,
+    sy: f64,
+    ox: f64,
+    oy: f64,
+}
+
+/// Where a screen's undimmed pixels come from.
+#[derive(Debug, Clone, Copy)]
+enum Src {
+    /// The frame, from its pixel (`fx`, `fy`) on.
+    Frame { fx: u32, fy: u32 },
+    /// The screen's own capture, `Frame::natives[i]`.
+    Native(usize),
+}
+
 /// One screen's part of the frame, prepared once.
 pub struct Pixels {
-    /// This screen's top-left in frame pixels.
-    fx: u32,
-    fy: u32,
+    src: Src,
     pub width: u32,
     pub height: u32,
     /// The frame, dimmed, as opaque XRGB8888 (gaps in the frame are black).
     dim: Vec<u8>,
     /// B, G, R.
     accent: [u8; 3],
+    map: Map,
 }
 
 impl Pixels {
-    /// `None` when the screen lies outside the frame.
+    /// The screen's buffer: the screen's own capture when the frame has one
+    /// (a screen drawn at a lower scale than the frame), else the part of
+    /// the frame it occupies, 1:1. `None` when the screen lies outside the
+    /// frame.
     pub fn new(frame: &Frame, geom: &Rect, dim: f32, accent: [u8; 3]) -> Option<Pixels> {
-        let (fx, fy, fw, fh) = frame.pixel_rect(geom);
+        let keep = 1.0 - dim.clamp(0.0, 0.9);
+        let k = (keep * 256.0) as u32;
+        let native = frame
+            .outputs
+            .iter()
+            .find(|o| o.logical == *geom)
+            .and_then(|o| frame.natives.iter().position(|n| n.name == o.name))
+            .filter(|&i| {
+                let (w, h) = frame.natives[i].image.dimensions();
+                w > 0 && h > 0 && geom.w > 0 && geom.h > 0
+            });
+        let (src, fw, fh, map) = match native {
+            Some(i) => {
+                let (w, h) = frame.natives[i].image.dimensions();
+                let map = Map {
+                    lx: geom.x,
+                    ly: geom.y,
+                    sx: w as f64 / geom.w as f64,
+                    sy: h as f64 / geom.h as f64,
+                    ox: 0.0,
+                    oy: 0.0,
+                };
+                (Src::Native(i), w, h, map)
+            }
+            None => {
+                let (fx, fy, fw, fh) = frame.screen_rect(geom);
+                let map = Map {
+                    lx: frame.bounds.x,
+                    ly: frame.bounds.y,
+                    sx: frame.scale,
+                    sy: frame.scale,
+                    ox: fx as f64,
+                    oy: fy as f64,
+                };
+                (Src::Frame { fx, fy }, fw, fh, map)
+            }
+        };
         if fw == 0 || fh == 0 {
             return None;
         }
-        let keep = 1.0 - dim.clamp(0.0, 0.9);
-        let k = (keep * 256.0) as u32;
+        let mut px = Pixels {
+            src,
+            width: fw,
+            height: fh,
+            dim: Vec::new(),
+            accent: [accent[2], accent[1], accent[0]],
+            map,
+        };
         let row_len = fw as usize * 4;
         let mut out = vec![0u8; row_len * fh as usize];
-        let iw = frame.image.width() as usize;
-        let img = frame.image.as_raw();
         for (y, dst) in out.chunks_exact_mut(row_len).enumerate() {
-            let start = ((fy as usize + y) * iw + fx as usize) * 4;
-            let src = &img[start..start + row_len];
+            let src = px.row(frame, y);
             for (d, s) in dst
                 .as_chunks_mut::<4>()
                 .0
@@ -110,35 +172,42 @@ impl Pixels {
                 *d = [c(s[2]), c(s[1]), c(s[0]), 255];
             }
         }
-        Some(Pixels {
-            fx,
-            fy,
-            width: fw,
-            height: fh,
-            dim: out,
-            accent: [accent[2], accent[1], accent[0]],
-        })
+        px.dim = out;
+        Some(px)
+    }
+
+    /// Row `y` of the undimmed screen, straight RGBA.
+    fn row<'f>(&self, frame: &'f Frame, y: usize) -> &'f [u8] {
+        let w = self.width as usize;
+        match self.src {
+            Src::Frame { fx, fy } => {
+                let iw = frame.image.width() as usize;
+                let at = ((fy as usize + y) * iw + fx as usize) * 4;
+                &frame.image.as_raw()[at..at + w * 4]
+            }
+            Src::Native(i) => &frame.natives[i].image.as_raw()[y * w * 4..(y + 1) * w * 4],
+        }
     }
 
     pub fn bounds(&self) -> Rect {
         Rect::new(0, 0, self.width as i32, self.height as i32)
     }
 
-    fn shape(&self, frame: &Frame, sel: &Rect) -> Shape {
-        Shape::new(frame, sel, self.fx, self.fy)
+    fn shape(&self, sel: &Rect) -> Shape {
+        Shape::with(&self.map, sel)
     }
 
     /// The pixels that can differ between selection `prev` and `want`
     /// (logical), clipped to this screen. Empty when nothing on this screen
     /// changes.
-    pub fn changed(&self, frame: &Frame, prev: Option<Rect>, want: Option<Rect>) -> Rects {
+    pub fn changed(&self, prev: Option<Rect>, want: Option<Rect>) -> Rects {
         let mut out = Rects::new();
         if prev == want {
             return out;
         }
         let bounds = self.bounds();
-        let a = prev.map(|r| self.shape(frame, &r));
-        let b = want.map(|r| self.shape(frame, &r));
+        let a = prev.map(|r| self.shape(&r));
+        let b = want.map(|r| self.shape(&r));
         // Plain undimmed frame under both selections: unchanged.
         let keep = match (&a, &b) {
             (Some(a), Some(b)) => a.inner().zip(b.inner()).and_then(|(x, y)| x.intersect(&y)),
@@ -171,7 +240,7 @@ impl Pixels {
     /// Brings `buf`, which shows `had`, up to date with the selection `want`.
     pub fn update(&self, frame: &Frame, buf: &mut [u8], had: Shows, want: Option<Rect>) {
         let buf = &mut buf[..self.dim.len()];
-        let shape = want.map(|r| self.shape(frame, &r));
+        let shape = want.map(|r| self.shape(&r));
         match had {
             Shows::Garbage => {
                 buf.copy_from_slice(&self.dim);
@@ -180,7 +249,7 @@ impl Pixels {
                 }
             }
             Shows::Selection(prev) => {
-                for r in self.changed(frame, prev, want).iter() {
+                for r in self.changed(prev, want).iter() {
                     self.paint(frame, buf, *r, shape.as_ref());
                 }
             }
@@ -196,15 +265,12 @@ impl Pixels {
             return;
         };
         let w = self.width as usize;
-        let iw = frame.image.width() as usize;
-        let img = frame.image.as_raw();
         let (rx0, rx1) = (r.x as usize, r.right() as usize);
         for y in r.y..r.bottom() {
             let row = y as usize * w * 4;
             let line = &mut buf[row..row + w * 4];
             let dim = &self.dim[row..row + w * 4];
-            let src_at = ((self.fy as usize + y as usize) * iw + self.fx as usize) * 4;
-            let src = &img[src_at..src_at + w * 4];
+            let src = self.row(frame, y as usize);
             let yc = y as f64 + 0.5;
             let Some(s) = shape.filter(|s| (yc - s.cy).abs() < s.hh + 0.5) else {
                 line[rx0 * 4..rx1 * 4].copy_from_slice(&dim[rx0 * 4..rx1 * 4]);
@@ -271,18 +337,33 @@ struct Shape {
 impl Shape {
     /// `sel` (logical) on a screen whose buffer starts at frame pixel
     /// (`fx`, `fy`).
+    #[cfg(test)]
     fn new(frame: &Frame, sel: &Rect, fx: u32, fy: u32) -> Shape {
         let s = frame.scale;
-        let x0 = (sel.x - frame.bounds.x) as f64 * s - fx as f64;
-        let y0 = (sel.y - frame.bounds.y) as f64 * s - fy as f64;
-        let (w, h) = (sel.w as f64 * s, sel.h as f64 * s);
+        Shape::with(
+            &Map {
+                lx: frame.bounds.x,
+                ly: frame.bounds.y,
+                sx: s,
+                sy: s,
+                ox: fx as f64,
+                oy: fy as f64,
+            },
+            sel,
+        )
+    }
+
+    fn with(m: &Map, sel: &Rect) -> Shape {
+        let x0 = (sel.x - m.lx) as f64 * m.sx - m.ox;
+        let y0 = (sel.y - m.ly) as f64 * m.sy - m.oy;
+        let (w, h) = (sel.w as f64 * m.sx, sel.h as f64 * m.sy);
         Shape {
             cx: x0 + w / 2.0,
             cy: y0 + h / 2.0,
             hw: w / 2.0,
             hh: h / 2.0,
-            r: (RADIUS * s).min(w / 2.0).min(h / 2.0),
-            bw: (BORDER * s).round().max(1.0),
+            r: (RADIUS * m.sx).min(w / 2.0).min(h / 2.0),
+            bw: (BORDER * m.sx).round().max(1.0),
         }
     }
 
@@ -371,7 +452,9 @@ mod tests {
             outputs: vec![OutputGeom {
                 name: "A".into(),
                 logical: bounds,
+                pixels: (0, 0),
             }],
+            natives: Vec::new(),
         }
     }
 
@@ -428,10 +511,12 @@ mod tests {
             OutputGeom {
                 name: "A".into(),
                 logical: a,
+                pixels: (0, 0),
             },
             OutputGeom {
                 name: "B".into(),
                 logical: b,
+                pixels: (0, 0),
             },
         ];
         (
@@ -440,6 +525,7 @@ mod tests {
                 bounds,
                 scale,
                 outputs,
+                natives: Vec::new(),
             },
             b,
         )
@@ -565,7 +651,7 @@ mod tests {
                 );
 
                 // Every pixel that changed since the last commit is damaged.
-                let damage = px.changed(&frame, shown, want);
+                let damage = px.changed(shown, want);
                 for (i, (a, b)) in shown_px.chunks(4).zip(full.chunks(4)).enumerate() {
                     if a != b {
                         let (x, y) = (
@@ -609,11 +695,11 @@ mod tests {
         // Entirely on the other screen.
         let a = Some(Rect::new(5, 5, 30, 30));
         let b = Some(Rect::new(6, 5, 31, 40));
-        assert!(px.changed(&frame, None, a).is_empty());
-        assert!(px.changed(&frame, a, b).is_empty());
+        assert!(px.changed(None, a).is_empty());
+        assert!(px.changed(a, b).is_empty());
         let c = Some(Rect::new(70, 10, 50, 50));
-        assert!(px.changed(&frame, c, c).is_empty());
-        assert!(!px.changed(&frame, a, c).is_empty());
+        assert!(px.changed(c, c).is_empty());
+        assert!(!px.changed(a, c).is_empty());
     }
 
     /// The redraw cost of dragging a full-screen selection on the owner's
@@ -634,7 +720,9 @@ mod tests {
             outputs: vec![OutputGeom {
                 name: "DP-2".into(),
                 logical: geom,
+                pixels: (0, 0),
             }],
+            natives: Vec::new(),
         };
         // A two-second drag (at 60 Hz) from the top-left corner to the
         // bottom-right one, then a second of small wobbles at full size.
@@ -720,7 +808,7 @@ mod tests {
         for (n, sel) in sels.iter().enumerate() {
             let t1 = Instant::now();
             let want = Some(*sel);
-            let damage = px.changed(&frame, shown, want);
+            let damage = px.changed(shown, want);
             let (buf, had) = &mut bufs[(n + 1) % 2];
             px.update(&frame, buf, *had, want);
             *had = Shows::Selection(want);

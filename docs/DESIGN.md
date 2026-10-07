@@ -83,6 +83,37 @@ notifies that one is in progress; `--region` skips the lock.
 - **Redaction** is an opaque fill, never a blur. It is best-effort and
   documented as such.
 
+## Overlay entry and exit (KWin animations)
+
+KWin's Scale effect animates every window it maps, and unmaps: a fade and a
+zoom of 160 ms at the default animation speed. On the frozen frame that
+looked like a second, smaller copy of the screen fading in over the live one
+as the screen dimmed ("duplicated background"), and the same in reverse when
+the overlay closed. The overlay now:
+
+- maps each screen as one transparent pixel stretched over it, and swaps in
+  the dimmed frame `hold` after the compositor's first frame callback for
+  it (the sign the animation started), or a fixed time after the configure
+  if none comes. The animation then plays out on nothing. `hold` is 180 ms
+  scaled by Plasma's animation speed (`AnimationDurationFactor`), and zero
+  when KWin isn't running or has neither the `scale` nor the `fade` effect
+  loaded. `TELAMON_HOLD_MS` overrides it (for tests).
+- swaps the transparent pixel back in before it closes, so the close
+  animation has nothing to show either.
+- shows each screen 1:1: a screen drawn at a lower scale than the frame
+  (frame pixels per logical unit is the highest scale of all outputs) is
+  shown from its own `CaptureScreen`, not from the resampled frame, and the
+  frame's scale snaps to a multiple of 1/120 (wp-fractional-scale), so the
+  frozen frame lines up with what KWin drew.
+
+The cost: the dim appears about 180 ms after the screen was frozen (the
+frozen frame is what the selection crops, so nothing is lost; the user sees
+the live screen for that long). Measured in KWin's virtual backend, capturing
+the output while the overlay starts and quits: before, the fade showed a
+residual of 4-7 gray levels (mean) against a plain live-to-dim blend, over
+about 100 ms; after, the screen steps from live to dim in one frame, with
+zero residual, on entry and on exit.
+
 ## Failure modes
 
 | Failure | Behaviour |
@@ -107,7 +138,8 @@ a hotkey, so stderr alone would be invisible.
 
 ## Performance budget
 
-- **Hotkey to overlay:** under 150 ms at 4K + 1080p.
+- **Hotkey to overlay:** the frame is frozen under 150 ms at 4K + 1080p;
+  under KWin's open animation the dim follows after the hold (see above).
 - **Release to clipboard (image):** under 300 ms for a full 4K frame (fast
   PNG compression).
 - **Selection redraw:** at most one per frame callback, however fast the

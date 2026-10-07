@@ -75,6 +75,18 @@ impl Rect {
 pub struct OutputGeom {
     pub name: String,
     pub logical: Rect,
+    /// The output's size in device pixels as the user sees it (turned by
+    /// its transform); 0x0 when the compositor didn't say.
+    pub pixels: (u32, u32),
+}
+
+/// One output as it was on screen, in its own pixels. Kept only for
+/// outputs whose scale is lower than the frame's: the frame has them
+/// resampled, and showing that resampled copy would not line up with what
+/// the compositor drew there.
+pub struct Native {
+    pub name: String,
+    pub image: RgbaImage,
 }
 
 /// The frozen workspace.
@@ -86,6 +98,7 @@ pub struct Frame {
     /// Frame pixels per logical unit.
     pub scale: f64,
     pub outputs: Vec<OutputGeom>,
+    pub natives: Vec<Native>,
 }
 
 impl Frame {
@@ -101,6 +114,24 @@ impl Frame {
             .clamp(0.0, iw);
         let y1 = (((r.bottom() - self.bounds.y) as f64) * s)
             .ceil()
+            .clamp(0.0, ih);
+        (x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32)
+    }
+
+    /// The frame pixels a screen occupies: its corner and size at the frame's
+    /// scale, rounded to the nearest pixel (as compositors place outputs),
+    /// not outwards like `pixel_rect`: a screen's buffer is shown 1:1, and
+    /// an extra pixel would stretch it. Clamped to the frame.
+    pub fn screen_rect(&self, r: &Rect) -> (u32, u32, u32, u32) {
+        let s = self.scale;
+        let (iw, ih) = (self.image.width() as f64, self.image.height() as f64);
+        let x0 = (((r.x - self.bounds.x) as f64) * s).round().clamp(0.0, iw);
+        let y0 = (((r.y - self.bounds.y) as f64) * s).round().clamp(0.0, ih);
+        let x1 = (((r.right() - self.bounds.x) as f64) * s)
+            .round()
+            .clamp(0.0, iw);
+        let y1 = (((r.bottom() - self.bounds.y) as f64) * s)
+            .round()
             .clamp(0.0, ih);
         (x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32)
     }
@@ -135,7 +166,11 @@ pub fn capture_workspace(session: &mut Session, include_cursor: bool) -> Result<
     // Wayland protocols; KWin's reason is the one reported if all fail.
     let mut skipped = Vec::new();
     let kwin_error = match kwin::capture_workspace(include_cursor) {
-        Ok(image) => return frame_from_workspace_image(image, bounds, outputs),
+        Ok(image) => {
+            let mut frame = frame_from_workspace_image(image, bounds, outputs)?;
+            frame.natives = kwin_natives(&frame, include_cursor);
+            return Ok(frame);
+        }
         Err(CaptureError::Failed(e)) => Some(e),
         Err(CaptureError::Unavailable(why)) => {
             skipped.push(why);
@@ -155,13 +190,46 @@ pub fn capture_workspace(session: &mut Session, include_cursor: bool) -> Result<
     }
 }
 
+/// The outputs drawn at a lower scale than the frame, as KWin shows them.
+/// A failure only costs the exact match on that output: the frame's copy
+/// is shown instead.
+fn kwin_natives(frame: &Frame, include_cursor: bool) -> Vec<Native> {
+    frame
+        .outputs
+        .iter()
+        .filter(|o| {
+            let (w, h) = o.pixels;
+            w > 0 && h > 0 && (w as f64) < o.logical.w as f64 * frame.scale * 0.98
+        })
+        .filter_map(|o| {
+            let image = kwin::capture_screen(&o.name, include_cursor).ok()?;
+            (image.dimensions() == o.pixels).then(|| Native {
+                name: o.name.clone(),
+                image,
+            })
+        })
+        .collect()
+}
+
+/// The pixels-per-logical-unit a compositor can mean: a multiple of 1/120
+/// (wp-fractional-scale), when the measured value is within rounding of one.
+/// KWin's image is `round(width * 1.7)` wide, which measures 1.69991.
+fn snap_scale(scale: f64) -> f64 {
+    let snapped = (scale * 120.0).round() / 120.0;
+    if (snapped - scale).abs() < 0.002 * scale {
+        snapped
+    } else {
+        scale
+    }
+}
+
 /// KWin's workspace capture is already one image of the whole layout.
 fn frame_from_workspace_image(
     image: RgbaImage,
     bounds: Rect,
     outputs: Vec<OutputGeom>,
 ) -> Result<Frame, String> {
-    let scale = image.width() as f64 / bounds.w as f64;
+    let scale = snap_scale(image.width() as f64 / bounds.w as f64);
     let expected_h = bounds.h as f64 * scale;
     if bounds.w <= 0
         || bounds.h <= 0
@@ -182,6 +250,7 @@ fn frame_from_workspace_image(
         bounds,
         scale,
         outputs,
+        natives: Vec::new(),
     })
 }
 
@@ -211,6 +280,7 @@ fn compose(
         ));
     }
     let mut image = RgbaImage::new(fw as u32, fh as u32);
+    let mut natives = Vec::new();
     for shot in shots {
         let l = shot.geom.logical;
         let w = (l.w as f64 * scale).round() as u32;
@@ -218,12 +288,17 @@ fn compose(
         let scaled = if shot.image.dimensions() == (w, h) {
             shot.image
         } else {
-            image::imageops::resize(
+            let scaled = image::imageops::resize(
                 &shot.image,
                 w.max(1),
                 h.max(1),
                 image::imageops::FilterType::Triangle,
-            )
+            );
+            natives.push(Native {
+                name: shot.geom.name.clone(),
+                image: shot.image,
+            });
+            scaled
         };
         let x = ((l.x - bounds.x) as f64 * scale).round() as i64;
         let y = ((l.y - bounds.y) as f64 * scale).round() as i64;
@@ -234,6 +309,7 @@ fn compose(
         bounds,
         scale,
         outputs,
+        natives,
     })
 }
 
@@ -296,7 +372,9 @@ mod tests {
             outputs: vec![OutputGeom {
                 name: "A".into(),
                 logical: bounds,
+                pixels: (0, 0),
             }],
+            natives: Vec::new(),
         }
     }
 
@@ -342,10 +420,12 @@ mod tests {
         let a = OutputGeom {
             name: "A".into(),
             logical: Rect::new(0, 0, 4, 2),
+            pixels: (0, 0),
         };
         let b = OutputGeom {
             name: "B".into(),
             logical: Rect::new(4, 0, 2, 2),
+            pixels: (0, 0),
         };
         let shots = vec![
             OutputShot {
