@@ -1,6 +1,6 @@
 [package]
 name = "telamon-screenshot"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Region screenshots to the Wayland clipboard: image, OCR text or redacted image"

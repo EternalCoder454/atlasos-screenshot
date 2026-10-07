@@ -71,6 +71,8 @@ pub struct Style {
 pub struct Mods {
     pub ctrl: bool,
     pub alt: bool,
+    /// Open the editor with the picture.
+    pub shift: bool,
 }
 
 /// Shows the overlay until the user selects or cancels. `Ok(None)` is a cancel.
@@ -846,6 +848,7 @@ impl KeyboardHandler for Overlay {
         self.mods = Mods {
             ctrl: m.ctrl,
             alt: m.alt,
+            shift: m.shift,
         };
     }
 }

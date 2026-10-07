@@ -5,9 +5,11 @@
 
 use std::collections::HashMap;
 use std::io::Write;
+use std::path::PathBuf;
 use std::time::Duration;
 
-use zbus::zvariant::Value;
+use zbus::blocking::{Connection, MessageIterator};
+use zbus::zvariant::{StructureBuilder, Value};
 
 const APP: &str = "Telamon Screenshot";
 const ICON: &str = "applets-screenshooter";
@@ -22,6 +24,186 @@ pub fn show(text: &str) {
         .map(|c| c.to_uppercase().chain(chars).collect())
         .unwrap_or_default();
     send(&escape(&body));
+}
+
+const APP_ID: &str = "net.eterneon.telamon.screenshot";
+const DEST: &str = "org.freedesktop.Notifications";
+const PATH: &str = "/org/freedesktop/Notifications";
+
+/// The picture shown in a capture's notification.
+pub enum Image {
+    /// The saved file (the server loads and scales it).
+    File(PathBuf),
+    /// A small copy, for a capture that wasn't saved: RGBA, `w * h * 4` bytes.
+    Thumb { w: u32, h: u32, rgba: Vec<u8> },
+}
+
+/// A capture's notification: title, body, picture and buttons.
+pub struct Toast {
+    pub title: String,
+    /// Plain text; escaped on the way out.
+    pub body: String,
+    pub image: Option<Image>,
+    /// `(key, label)`
+    pub actions: Vec<(&'static str, &'static str)>,
+}
+
+/// The longest side of the thumbnail sent when there is no file.
+pub const THUMB_MAX: u32 = 320;
+
+/// A copy of `img` no larger than `THUMB_MAX` on a side.
+pub fn thumb(img: &image::RgbaImage) -> Image {
+    let (w, h) = img.dimensions();
+    let k = (THUMB_MAX as f64 / w.max(h) as f64).min(1.0);
+    let (tw, th) = (
+        ((w as f64 * k).round() as u32).max(1),
+        ((h as f64 * k).round() as u32).max(1),
+    );
+    let small = if (tw, th) == (w, h) {
+        img.clone()
+    } else {
+        image::imageops::thumbnail(img, tw, th)
+    };
+    Image::Thumb {
+        w: tw,
+        h: th,
+        rgba: small.into_raw(),
+    }
+}
+
+/// The action list as `Notify` wants it: key, label, key, label...
+fn flat_actions(actions: &[(&str, &str)]) -> Vec<String> {
+    actions
+        .iter()
+        .flat_map(|(k, l)| [k.to_string(), l.to_string()])
+        .collect()
+}
+
+/// What a capture's notification sends: its buttons, and with a file the
+/// body's own click (the server's "default" action, which it doesn't show)
+/// that opens it.
+fn toast_actions(actions: &[(&str, &str)]) -> Vec<String> {
+    let mut flat = flat_actions(actions);
+    if actions.contains(&crate::actions::OPEN) {
+        flat.splice(0..0, [crate::actions::DEFAULT.to_string(), String::new()]);
+    }
+    flat
+}
+
+/// The hints of a capture notification.
+fn toast_hints(image: &Option<Image>) -> HashMap<&'static str, Value<'static>> {
+    let mut hints: HashMap<&str, Value> = HashMap::new();
+    hints.insert("urgency", Value::from(1u8));
+    hints.insert("desktop-entry", Value::from(APP_ID));
+    match image {
+        Some(Image::File(path)) => {
+            hints.insert("image-path", Value::from(crate::actions::file_uri(path)));
+        }
+        Some(Image::Thumb { w, h, rgba }) => {
+            let data = StructureBuilder::new()
+                .add_field(*w as i32)
+                .add_field(*h as i32)
+                .add_field(*w as i32 * 4)
+                .add_field(true)
+                .add_field(8i32)
+                .add_field(4i32)
+                .add_field(rgba.clone())
+                .build();
+            if let Ok(data) = data {
+                hints.insert("image-data", Value::from(data));
+            }
+        }
+        None => {}
+    }
+    hints
+}
+
+/// Listens for the signals of the notification server. Made before the
+/// notification is sent, so a quick click is not missed.
+pub fn watch(conn: &Connection) -> Result<MessageIterator, String> {
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .interface("org.freedesktop.Notifications")
+        .and_then(|b| b.path(PATH))
+        .map(|b| b.build())
+        .map_err(|e| e.to_string())?;
+    MessageIterator::for_match_rule(rule, conn, Some(16)).map_err(|e| e.to_string())
+}
+
+/// Shows a capture's notification and returns its id.
+///
+/// Also returns the unique name of the server that answered: only its
+/// signals count (see `next_event`).
+pub fn send_toast(conn: &Connection, toast: &Toast) -> Result<(u32, String), String> {
+    let reply = conn
+        .call_method(
+            Some(DEST),
+            PATH,
+            Some(DEST),
+            "Notify",
+            &(
+                APP,
+                0u32,
+                ICON,
+                toast.title.as_str(),
+                escape(&toast.body),
+                toast_actions(&toast.actions),
+                toast_hints(&toast.image),
+                -1i32,
+            ),
+        )
+        .map_err(|e| e.to_string())?;
+    let sender = reply
+        .header()
+        .sender()
+        .map(|s| s.to_string())
+        .ok_or("the notification server has no name")?;
+    let id = reply
+        .body()
+        .deserialize::<u32>()
+        .map_err(|e| e.to_string())?;
+    Ok((id, sender))
+}
+
+/// What happened to our notification.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Event {
+    Action(String),
+    /// Closed, with the server's reason (1 expired, 2 dismissed, 3 closed by
+    /// a call, 4 undefined).
+    Closed(u32),
+}
+
+/// The next event for notification `id` from the server `sender` (another
+/// process on the bus could emit the same signals); `None` when the bus goes
+/// away.
+pub fn next_event(events: &mut MessageIterator, id: u32, sender: &str) -> Option<Event> {
+    for msg in events.by_ref() {
+        let Ok(msg) = msg else { continue };
+        let header = msg.header();
+        if header.sender().map(|s| s.as_str()) != Some(sender) {
+            continue;
+        }
+        let body = msg.body();
+        match header.member().map(|m| m.as_str()) {
+            Some("ActionInvoked") => {
+                if let Ok((nid, key)) = body.deserialize::<(u32, String)>()
+                    && nid == id
+                {
+                    return Some(Event::Action(key));
+                }
+            }
+            Some("NotificationClosed") => {
+                if let Ok((nid, reason)) = body.deserialize::<(u32, u32)>()
+                    && nid == id
+                {
+                    return Some(Event::Closed(reason));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The body may be read as markup (`<b>`, `<a href>`); the text can hold
@@ -60,6 +242,74 @@ fn send(body: &str) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn actions_are_flattened_as_key_label_pairs() {
+        assert_eq!(
+            flat_actions(&[crate::actions::OPEN, crate::actions::FOLDER]),
+            ["open", "Open", "folder", "Show in Folder"]
+        );
+    }
+
+    #[test]
+    fn a_click_on_the_body_is_offered_only_with_a_file() {
+        use crate::actions::{COPY, EDIT, FOLDER, OPEN};
+        assert_eq!(
+            toast_actions(&[OPEN, FOLDER, EDIT, COPY]),
+            [
+                "default",
+                "",
+                "open",
+                "Open",
+                "folder",
+                "Show in Folder",
+                "edit",
+                "Edit",
+                "copy",
+                "Copy"
+            ]
+        );
+        assert_eq!(
+            toast_actions(&[EDIT, COPY]),
+            ["edit", "Edit", "copy", "Copy"]
+        );
+    }
+
+    #[test]
+    fn the_image_goes_as_a_path_or_as_data() {
+        let h = toast_hints(&Some(Image::File(PathBuf::from("/p/a b.png"))));
+        assert_eq!(
+            <&str>::try_from(&h["image-path"]),
+            Ok("file:///p/a%20b.png")
+        );
+        assert!(!h.contains_key("image-data"));
+        assert_eq!(<&str>::try_from(&h["desktop-entry"]), Ok(APP_ID));
+        let h = toast_hints(&Some(Image::Thumb {
+            w: 2,
+            h: 1,
+            rgba: vec![0; 8],
+        }));
+        assert!(h.contains_key("image-data") && !h.contains_key("image-path"));
+        assert!(!toast_hints(&None).contains_key("image-data"));
+    }
+
+    #[test]
+    fn thumbnails_are_small() {
+        let big = image::RgbaImage::new(3840, 2160);
+        match thumb(&big) {
+            Image::Thumb { w, h, rgba } => {
+                assert_eq!((w, h), (320, 180));
+                assert_eq!(rgba.len(), 320 * 180 * 4);
+            }
+            _ => panic!(),
+        }
+        match thumb(&image::RgbaImage::new(40, 30)) {
+            Image::Thumb { w, h, .. } => assert_eq!((w, h), (40, 30)),
+            _ => panic!(),
+        }
+    }
+
     #[test]
     fn markup_is_escaped() {
         assert_eq!(

@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::legacy;
+use crate::modes::Kind;
 
 /// A config file this large is not a config file.
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
@@ -24,11 +25,29 @@ pub struct Config {
     pub output: OutputConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CaptureConfig {
-    /// Draw the pointer into the frozen frame.
+    /// Draw the pointer into the picture.
     pub include_cursor: bool,
+    /// What a bare `telamon-screenshot` (and the Print key) captures:
+    /// `region`, `full`, `screen`, `active-window` or `window`.
+    pub default_mode: Kind,
+    /// Windows come with their title bar and borders.
+    pub window_frame: bool,
+    /// Windows come with their shadow (transparent around them).
+    pub window_shadow: bool,
+}
+
+impl Default for CaptureConfig {
+    fn default() -> Self {
+        Self {
+            include_cursor: false,
+            default_mode: Kind::Region,
+            window_frame: true,
+            window_shadow: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -53,11 +72,26 @@ pub struct RedactConfig {
     pub padding: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct OutputConfig {
-    /// Also save each image capture as a PNG here. Unset: never write to disk.
+    /// Save each image capture as a PNG. Text (OCR) captures are never saved.
+    pub save: bool,
+    /// Where. Unset: the Screenshots folder in the Pictures folder.
     pub save_dir: Option<PathBuf>,
+    /// Show a notification (with Open, Show in Folder, Edit and Copy) after
+    /// each capture. Errors are always shown.
+    pub notify: bool,
+}
+
+impl Default for OutputConfig {
+    fn default() -> Self {
+        Self {
+            save: true,
+            save_dir: None,
+            notify: true,
+        }
+    }
 }
 
 impl Default for OverlayConfig {
@@ -252,7 +286,28 @@ mod tests {
         assert!(parse("[ocr]\nmodel_dir = \"/x\"\n").is_err());
         assert!(parse("[output]\nsave_dir = \"Pictures\"\n").is_err());
         assert!(parse("[capture]\ninclude_cursor = \"yes\"\n").is_err());
+        assert!(parse("[capture]\ndefault_mode = \"everything\"\n").is_err());
+        assert!(parse("[capture]\nwindow_frame = 1\n").is_err());
+        assert!(parse("[output]\nsave = \"no\"\n").is_err());
+        assert!(parse("[output]\nnotify = 2\n").is_err());
         assert!(parse("not toml at all [").is_err());
+    }
+
+    #[test]
+    fn capture_and_output_options() {
+        let d = Config::default();
+        assert_eq!(d.capture.default_mode, Kind::Region);
+        assert!(d.capture.window_frame && d.capture.window_shadow);
+        assert!(d.output.save && d.output.notify && d.output.save_dir.is_none());
+        let cfg = parse(
+            "[capture]\ndefault_mode = \"active-window\"\nwindow_shadow = false\n\
+             [output]\nsave = false\nnotify = false\nsave_dir = \"/srv/shots\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.capture.default_mode, Kind::ActiveWindow);
+        assert!(cfg.capture.window_frame && !cfg.capture.window_shadow);
+        assert!(!cfg.output.save && !cfg.output.notify);
+        assert_eq!(cfg.output.save_dir, Some(PathBuf::from("/srv/shots")));
     }
 
     #[test]
