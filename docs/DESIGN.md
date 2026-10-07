@@ -126,3 +126,25 @@ a hotkey, so stderr alone would be invisible.
 The redraw benchmark replays a two-second full-screen drag at 3840x2160
 (scale 1.7) with the old and the new painting:
 `scripts/dev.sh cargo test --release --locked redraw_bench -- --ignored --nocapture`.
+
+## Names before the rename (0.2.0)
+
+The app was `atlasos-screenshot` (`net.eterneon.atlas.screenshot`) until 0.2.0.
+For that release only, and to be removed after the image has moved:
+
+- the package `Obsoletes`/`Provides` `atlasos-screenshot`, and
+  `/usr/bin/atlasos-screenshot` is a link to `telamon-screenshot`. KWin
+  resolves the caller to its real path (`/proc/<pid>/exe`), so the link runs
+  with the grant of the new `.desktop` file (checked against KWin in
+  `scripts/e2e-kwin.sh`);
+- the lock is taken under `telamon-screenshot.lock` and
+  `atlasos-screenshot.lock`, so a running instance of either name keeps a
+  second overlay out;
+- `src/legacy.rs` moves `$XDG_CONFIG_HOME/atlasos-screenshot` and
+  `$XDG_DATA_HOME/atlasos-screenshot` to the new names, once, with one
+  `renameat2(RENAME_NOREPLACE)` (atomic, never replaces). If the move fails
+  the config is read in place, and the models are downloaded again.
+
+The old `.desktop` file is not kept: two files with the same `X-KDE-Shortcuts`
+would fight over Meta+Shift+S. A shortcut the user changed is stored by
+kglobalaccel under the old file name and is not carried over.
