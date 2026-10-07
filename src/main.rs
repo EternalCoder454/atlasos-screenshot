@@ -187,7 +187,8 @@ fn run(args: &Args, cfg: &Config) -> Result<bool, String> {
         return Ok(false);
     };
     let mode = mode_for(mods, args.mode);
-    let edit = args.edit || mods.shift;
+    // Text goes to the clipboard only: there is no picture to edit.
+    let edit = (args.edit || mods.shift) && !matches!(mode, Mode::Text);
 
     // Too small to hold a line of text (and below what the models take).
     let readable = crop.width() >= MIN_OCR_PX && crop.height() >= MIN_OCR_PX;

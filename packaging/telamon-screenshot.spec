@@ -49,6 +49,8 @@ BuildRequires:  qt6-qtsvg
 
 # The keyboard state of the selection overlay
 Requires:       libxkbcommon
+# The notification's Open button (and Show in Folder without a file manager).
+Requires:       xdg-utils
 # The editor: Qt Quick on Telamon.Ui (Kirigami and the Plasma style give it
 # the desktop's colours and fonts; the icons are SVG).
 Requires:       telamon-ui >= 2.0.0
@@ -81,8 +83,9 @@ Conflicts:      spectacle
 %description spectacle-compat
 Programs that ask org.kde.Spectacle for a screenshot (the Plasma panel's
 screenshot entries, scripts using its D-Bus interface) get Telamon
-Screenshot's answer. Ships the D-Bus service file; installing it replaces the
-spectacle package.
+Screenshot's answer. Ships the D-Bus service file. It conflicts with the
+spectacle package, which has to be removed first (dnf install --allowerasing
+does it): the two can't own org.kde.Spectacle and Print together.
 
 %prep
 %autosetup -n telamon-screenshot-%{version}

@@ -12,7 +12,7 @@
 
 use std::ffi::OsString;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -71,6 +71,16 @@ impl Shared {
 
     /// Runs one capture and answers with the signal.
     fn capture(self: &Arc<Self>, args: Vec<OsString>) {
+        // One at a time, as the program itself allows: a caller in a loop
+        // gets failures, not a process and a notification each.
+        if self
+            .running
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            self.emit("ScreenshotFailed", "A screenshot is already in progress");
+            return;
+        }
         let exe = crate::actions::self_exe();
         let child = Command::new(exe)
             .args(args)
@@ -79,10 +89,10 @@ impl Shared {
             .stderr(Stdio::piped())
             .spawn();
         let Ok(child) = child else {
+            self.running.fetch_sub(1, Ordering::SeqCst);
             self.emit("ScreenshotFailed", "Screenshot capture couldn't be started");
             return;
         };
-        self.running.fetch_add(1, Ordering::SeqCst);
         let me = Arc::clone(self);
         std::thread::spawn(move || {
             let out = child.wait_with_output();
@@ -109,14 +119,27 @@ impl Shared {
     }
 
     fn editor(&self) {
+        // One editor from here at a time.
+        static OPEN: AtomicBool = AtomicBool::new(false);
+        if OPEN.swap(true, Ordering::SeqCst) {
+            return;
+        }
         let exe = crate::actions::self_exe();
         let editor = crate::actions::editor_path(&exe);
-        let _ = Command::new(editor)
+        let editor = Command::new(editor)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn()
-            .map(|mut c| std::thread::spawn(move || c.wait()));
+            .spawn();
+        match editor {
+            Ok(mut c) => {
+                std::thread::spawn(move || {
+                    let _ = c.wait();
+                    OPEN.store(false, Ordering::SeqCst);
+                });
+            }
+            Err(_) => OPEN.store(false, Ordering::SeqCst),
+        }
     }
 }
 

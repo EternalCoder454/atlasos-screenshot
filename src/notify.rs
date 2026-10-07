@@ -79,6 +79,17 @@ fn flat_actions(actions: &[(&str, &str)]) -> Vec<String> {
         .collect()
 }
 
+/// What a capture's notification sends: its buttons, and with a file the
+/// body's own click (the server's "default" action, which it doesn't show)
+/// that opens it.
+fn toast_actions(actions: &[(&str, &str)]) -> Vec<String> {
+    let mut flat = flat_actions(actions);
+    if actions.contains(&crate::actions::OPEN) {
+        flat.splice(0..0, [crate::actions::DEFAULT.to_string(), String::new()]);
+    }
+    flat
+}
+
 /// The hints of a capture notification.
 fn toast_hints(image: &Option<Image>) -> HashMap<&'static str, Value<'static>> {
     let mut hints: HashMap<&str, Value> = HashMap::new();
@@ -120,7 +131,10 @@ pub fn watch(conn: &Connection) -> Result<MessageIterator, String> {
 }
 
 /// Shows a capture's notification and returns its id.
-pub fn send_toast(conn: &Connection, toast: &Toast) -> Result<u32, String> {
+///
+/// Also returns the unique name of the server that answered: only its
+/// signals count (see `next_event`).
+pub fn send_toast(conn: &Connection, toast: &Toast) -> Result<(u32, String), String> {
     let reply = conn
         .call_method(
             Some(DEST),
@@ -133,13 +147,22 @@ pub fn send_toast(conn: &Connection, toast: &Toast) -> Result<u32, String> {
                 ICON,
                 toast.title.as_str(),
                 escape(&toast.body),
-                flat_actions(&toast.actions),
+                toast_actions(&toast.actions),
                 toast_hints(&toast.image),
                 -1i32,
             ),
         )
         .map_err(|e| e.to_string())?;
-    reply.body().deserialize::<u32>().map_err(|e| e.to_string())
+    let sender = reply
+        .header()
+        .sender()
+        .map(|s| s.to_string())
+        .ok_or("the notification server has no name")?;
+    let id = reply
+        .body()
+        .deserialize::<u32>()
+        .map_err(|e| e.to_string())?;
+    Ok((id, sender))
 }
 
 /// What happened to our notification.
@@ -151,11 +174,16 @@ pub enum Event {
     Closed(u32),
 }
 
-/// The next event for notification `id`; `None` when the bus goes away.
-pub fn next_event(events: &mut MessageIterator, id: u32) -> Option<Event> {
+/// The next event for notification `id` from the server `sender` (another
+/// process on the bus could emit the same signals); `None` when the bus goes
+/// away.
+pub fn next_event(events: &mut MessageIterator, id: u32, sender: &str) -> Option<Event> {
     for msg in events.by_ref() {
         let Ok(msg) = msg else { continue };
         let header = msg.header();
+        if header.sender().map(|s| s.as_str()) != Some(sender) {
+            continue;
+        }
         let body = msg.body();
         match header.member().map(|m| m.as_str()) {
             Some("ActionInvoked") => {
@@ -221,6 +249,30 @@ mod tests {
         assert_eq!(
             flat_actions(&[crate::actions::OPEN, crate::actions::FOLDER]),
             ["open", "Open", "folder", "Show in Folder"]
+        );
+    }
+
+    #[test]
+    fn a_click_on_the_body_is_offered_only_with_a_file() {
+        use crate::actions::{COPY, EDIT, FOLDER, OPEN};
+        assert_eq!(
+            toast_actions(&[OPEN, FOLDER, EDIT, COPY]),
+            [
+                "default",
+                "",
+                "open",
+                "Open",
+                "folder",
+                "Show in Folder",
+                "edit",
+                "Edit",
+                "copy",
+                "Copy"
+            ]
+        );
+        assert_eq!(
+            toast_actions(&[EDIT, COPY]),
+            ["edit", "Edit", "copy", "Copy"]
         );
     }
 

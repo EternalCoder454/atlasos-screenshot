@@ -66,7 +66,8 @@ connections are closed. The child:
   empty clipboard. The clipboard is live during that wait; only the
   process exit is later.
 
-Only one capture runs at a time (the delay and the window picker included).
+Only one capture runs at a time (the delay and the window picker included;
+the countdown has no way to be cancelled yet, so keep `--delay` short).
 It holds a `flock` on `$XDG_RUNTIME_DIR/telamon-screenshot.lock`, so a second
 hotkey press only notifies that one is in progress; `--region X,Y,WxH` skips
 the lock. The lock is released before the clipboard and notification

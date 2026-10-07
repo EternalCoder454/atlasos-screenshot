@@ -196,7 +196,7 @@ PY
     check "full: saved private (0600 or 0640 at most)" $([ "$(( $(stat -c %a "$f") & 07 ))" = 0 ]; echo $?)
     check "full: notification Screenshot Saved" $([ "$(notif summary)" = "Screenshot Saved" ]; echo $?)
     check "full: notification shows the file" $([ "$(notif hint:image-path)" = "file://$f" ]; echo $?)
-    check "full: notification buttons" $([ "$(notif actions)" = '["open", "Open", "folder", "Show in Folder", "edit", "Edit", "copy", "Copy"]' ]; echo $?)
+    check "full: notification buttons" $([ "$(notif actions)" = '["default", "", "open", "Open", "folder", "Show in Folder", "edit", "Edit", "copy", "Copy"]' ]; echo $?)
     check "full: notification is Telamon Screenshot's" $([ "$(notif hint:desktop-entry)" = net.eterneon.telamon.screenshot ]; echo $?)
     cp "$f" /out/full.png
     first=$f
@@ -239,6 +239,12 @@ sys.exit(0 if im.mode == "RGBA" and im.getchannel("A").getextrema()[0] < 255 els
     click open
     waitfor 5 grep -qxF "$rf" /out/xdg-open.log
     check "button Open: xdg-open gets the file as one argument" $?
+    shot --region 0,0,640x400
+    rf=$f
+    : >/out/xdg-open.log
+    click default
+    waitfor 5 grep -qxF "$rf" /out/xdg-open.log
+    check "click on the notification body: opens the file" $?
     shot --region 0,0,640x400
     rf=$f
     show_items() { grep -F '"kind": "show-items"' /out/notify.log | grep -qF "\"file://$rf\""; }

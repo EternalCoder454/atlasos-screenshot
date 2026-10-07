@@ -208,7 +208,7 @@ fn child(done: Done) -> i32 {
         image: done.image,
         actions: buttons(done.path.is_some(), done.png.is_some()),
     };
-    let Ok(id) = notify::send_toast(&conn, &toast) else {
+    let Ok((id, server)) = notify::send_toast(&conn, &toast) else {
         return 0;
     };
     if toast.actions.is_empty() {
@@ -218,7 +218,7 @@ fn child(done: Done) -> i32 {
         std::thread::sleep(LINGER);
         std::process::exit(0)
     });
-    serve(&conn, &mut events, id, &ctx, done.png.as_deref());
+    serve(&conn, &mut events, id, &server, &ctx, done.png.as_deref());
     0
 }
 
@@ -226,10 +226,11 @@ fn serve(
     conn: &zbus::blocking::Connection,
     events: &mut zbus::blocking::MessageIterator,
     id: u32,
+    server: &str,
     ctx: &Ctx,
     png: Option<&[u8]>,
 ) {
-    while let Some(ev) = notify::next_event(events, id) {
+    while let Some(ev) = notify::next_event(events, id, server) {
         match ev {
             Event::Action(key) => {
                 if let Some(launch) = actions::plan(&key, ctx) {
