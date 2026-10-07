@@ -1,6 +1,7 @@
+pragma ComponentBehavior: Bound
+
 import QtQuick
 import QtQuick.Layouts
-import QtQuick.Controls as QQC2
 import org.kde.kirigami as Kirigami
 import Telamon.Ui
 
@@ -16,6 +17,7 @@ TelamonWindow {
     readonly property alias docRef: doc
     readonly property alias backendRef: backend
     readonly property alias stageRef: stage
+    readonly property alias newPopoverRef: newPopover
 
     property string tool: "arrow"
     property int captureDelay: 0

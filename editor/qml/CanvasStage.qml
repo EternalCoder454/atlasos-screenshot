@@ -1,3 +1,5 @@
+pragma ComponentBehavior: Bound
+
 import QtQuick
 import Telamon.Ui
 
@@ -393,7 +395,7 @@ FocusScope {
                 required property var modelData
                 width: 10
                 height: 10
-                radius: 2
+                radius: TelamonStyle.radiusSmall
                 x: cropOverlay.cLeft + modelData[0] * (cropOverlay.cRight - cropOverlay.cLeft) - width / 2
                 y: cropOverlay.cTop + modelData[1] * (cropOverlay.cBottom - cropOverlay.cTop) - height / 2
                 color: TelamonStyle.accent
@@ -439,7 +441,7 @@ FocusScope {
             color: "transparent"
             border.width: 1
             border.color: TelamonStyle.accent
-            radius: 2
+            radius: TelamonStyle.radiusSmall
         }
 
         TextEdit {
@@ -449,7 +451,6 @@ FocusScope {
             wrapMode: TextEdit.NoWrap
             selectByMouse: true
             color: stage.drawColor
-            font.family: Qt.application.font.family
             font.weight: Font.Medium
             font.pixelSize: Math.max(8, stage.textSize * view.scale)
             selectionColor: TelamonStyle.accent

@@ -24,4 +24,7 @@ for mode in light dark; do
     "$b" --screenshot "$out/editor-$mode-empty.png"
     "$b" --screenshot "$out/editor-$mode-all-tools.png" --scenario "$t/scenario-all-tools.js" "$out/sample.png"
     "$b" --screenshot "$out/editor-$mode-crop.png" --scenario "$t/scenario-crop.js" "$out/sample.png"
+    for s in popover saveas discard toast; do
+        "$b" --screenshot "$out/editor-$mode-$s.png" --scenario "$t/scenario-$s.js" "$out/sample.png"
+    done
 done

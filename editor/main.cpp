@@ -5,7 +5,7 @@
 // a toolkit. FILE is an image to open, "-" reads the image from stdin, no
 // argument opens the empty state. Several instances may run at once.
 #include <QCommandLineParser>
-#include <QGuiApplication>
+#include <QApplication>
 #include <QIcon>
 #include <QQmlApplicationEngine>
 #include <QQuickStyle>
@@ -32,13 +32,16 @@ int main(int argc, char *argv[])
     if (qEnvironmentVariableIsEmpty("QT_QUICK_BACKEND"))
         QQuickWindow::setGraphicsApi(QSGRendererInterface::Software);
 
-    QGuiApplication app(argc, argv);
-    QGuiApplication::setApplicationName(u"Telamon Screenshot"_s);
-    QGuiApplication::setApplicationDisplayName(u"Telamon Screenshot"_s);
-    QGuiApplication::setOrganizationDomain(u"telamon.eterneon.net"_s);
-    QGuiApplication::setApplicationVersion(QStringLiteral(TELAMON_EDITOR_VERSION));
-    QGuiApplication::setDesktopFileName(u"net.eterneon.telamon.screenshot.editor"_s);
-    QGuiApplication::setWindowIcon(QIcon::fromTheme(u"accessories-screenshot"_s));
+    // QApplication, not QGuiApplication: the Plasma style (org.kde.desktop) draws with QStyle, which
+    // wants it (the file chooser fallback and any default control use it). Widgets is loaded by the
+    // style anyway.
+    QApplication app(argc, argv);
+    QApplication::setApplicationName(u"Telamon Screenshot"_s);
+    QApplication::setApplicationDisplayName(u"Telamon Screenshot"_s);
+    QApplication::setOrganizationDomain(u"telamon.eterneon.net"_s);
+    QApplication::setApplicationVersion(QStringLiteral(TELAMON_EDITOR_VERSION));
+    QApplication::setDesktopFileName(u"net.eterneon.telamon.screenshot.editor"_s);
+    QApplication::setWindowIcon(QIcon::fromTheme(u"accessories-screenshot"_s));
 
     // The Plasma style: Kirigami takes the colours and fonts of the desktop
     // (kdeglobals) from it, and Telamon.Ui follows Kirigami.
@@ -55,7 +58,7 @@ int main(int argc, char *argv[])
     // script on the window first, print the time of the first frame.
     const QCommandLineOption shotOpt(u"screenshot"_s, u"Grab the window to FILE and quit."_s, u"file"_s);
     const QCommandLineOption scenarioOpt(u"scenario"_s, u"JS file run with the window as `win`."_s, u"file"_s);
-    const QCommandLineOption firstFrameOpt(u"first-frame"_s, u"Print the epoch time (ms) of the first frame and quit."_s);
+    const QCommandLineOption firstFrameOpt(u"first-frame"_s, u"Print the epoch time (ms) of the first frame, then RSS and peak RSS (kB), and quit."_s);
     const QCommandLineOption waitOpt(u"wait"_s, u"Milliseconds to wait before the grab (default 700)."_s, u"ms"_s);
     parser.addOptions({shotOpt, scenarioOpt, firstFrameOpt, waitOpt});
 #endif
@@ -79,11 +82,25 @@ int main(int argc, char *argv[])
     auto *window = qobject_cast<QQuickWindow *>(engine.rootObjects().first());
     if (window && parser.isSet(firstFrameOpt)) {
         auto conn = std::make_shared<QMetaObject::Connection>();
-        *conn = QObject::connect(window, &QQuickWindow::frameSwapped, &app, [conn] {
+        *conn = QObject::connect(window, &QQuickWindow::frameSwapped, &app, [conn, window] {
             QObject::disconnect(*conn);
-            printf("%lld\n", static_cast<long long>(QDateTime::currentMSecsSinceEpoch()));
-            fflush(stdout);
-            QCoreApplication::quit();
+            const qint64 t = QDateTime::currentMSecsSinceEpoch();
+            // The frame of the image, not only the empty window: wait for the load, then report the memory a moment later.
+            QTimer::singleShot(600, window, [t] {
+                long rss = 0, hwm = 0;
+                QFile f(u"/proc/self/status"_s);
+                if (f.open(QIODevice::ReadOnly)) {
+                    for (const QByteArray &l : f.readAll().split('\n')) {
+                        if (l.startsWith("VmRSS:"))
+                            rss = l.mid(6).trimmed().split(' ').first().toLong();
+                        else if (l.startsWith("VmHWM:"))
+                            hwm = l.mid(6).trimmed().split(' ').first().toLong();
+                    }
+                }
+                printf("%lld %ld %ld\n", static_cast<long long>(t), rss, hwm);
+                fflush(stdout);
+                QCoreApplication::quit();
+            });
         });
     }
     if (window && parser.isSet(shotOpt)) {

@@ -13,7 +13,7 @@ include(GNUInstallDirs)
 
 option(TELAMON_EDITOR_TESTS "Build the tests and the test-only executable with the screenshot hooks" OFF)
 
-find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2)
+find_package(Qt6 6.8 REQUIRED COMPONENTS Core Gui Widgets Qml Quick QuickControls2)
 qt_policy(SET QTP0001 NEW)
 qt_policy(SET QTP0004 NEW)
 
@@ -50,7 +50,7 @@ target_include_directories(editorcore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 # Telamon.Ui and Kirigami are shared plugins that Qt finds at run time. The
 # scan of the imports (which looks for static plugins to link) has nothing to
 # do here and only warns about them, so it is skipped for the executables.
-set(EDITOR_LIBS editorcore editorcoreplugin Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick Qt6::QuickControls2)
+set(EDITOR_LIBS editorcore editorcoreplugin Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick Qt6::QuickControls2 Qt6::Widgets)
 
 qt_add_executable(telamon-screenshot-editor main.cpp)
 target_compile_definitions(telamon-screenshot-editor PRIVATE TELAMON_EDITOR_VERSION="${PROJECT_VERSION}")
