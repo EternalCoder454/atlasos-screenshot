@@ -5,6 +5,12 @@
 [capture]
 # Draw the pointer into the screenshot.
 include_cursor = false
+# What a bare `telamon-screenshot` (the Print key) takes:
+# "region", "full", "screen", "active-window" or "window".
+default_mode = "region"
+# Windows with their title bar and borders, and with their shadow.
+window_frame = true
+window_shadow = true
 
 [overlay]
 # How dark the screen gets around the selection, 0.0 to 0.9.
@@ -23,6 +29,10 @@ fill = "#000000"
 padding = 2
 
 [output]
-# Also save every image (plain and Alt drags) here as a PNG. Absolute path.
-# Unset (the default): nothing is ever written to disk.
+# Save every picture (not the text of an OCR copy) as a PNG, and copy it.
+# false: copy only; nothing is written to disk.
+save = true
+# Where. Absolute path. Unset: the Screenshots folder in your Pictures folder.
 # save_dir = "/home/you/Pictures/Screenshots"
+# The notification with Open, Show in Folder, Edit and Copy after each capture.
+notify = true

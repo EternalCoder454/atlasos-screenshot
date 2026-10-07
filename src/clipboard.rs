@@ -111,7 +111,7 @@ fn check_child(pid: libc::pid_t, status: rustix::fd::OwnedFd) -> Result<(), Stri
 
 /// Open descriptors above stderr, found by probing (no allocation or
 /// directory fd that could be confused with a later one).
-pub fn open_fds() -> Vec<libc::c_int> {
+fn open_fds() -> Vec<libc::c_int> {
     let max = rustix::process::getrlimit(rustix::process::Resource::Nofile)
         .current
         .unwrap_or(65536)
@@ -124,7 +124,7 @@ pub fn open_fds() -> Vec<libc::c_int> {
 
 /// New session, stdio to /dev/null, cwd to /, and the caller's other
 /// descriptors closed, so the server holds nothing of the caller's open.
-pub fn detach(inherited: &[libc::c_int]) {
+fn detach(inherited: &[libc::c_int]) {
     // SAFETY: plain syscalls on descriptors the child doesn't use, in a
     // single-threaded child.
     unsafe {

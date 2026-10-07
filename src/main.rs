@@ -66,6 +66,7 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Action::Run(args) => Some(args),
+        Action::Post => return ExitCode::from(post::run_helper() as u8),
         Action::SavePng | Action::CopyPng | Action::Dbus => None,
     };
 
@@ -227,13 +228,14 @@ fn run(args: &Args, cfg: &Config) -> Result<bool, String> {
         },
         _ => (None, None),
     };
-    let wants_post = edit || cfg.output.notify || save_error.is_some();
+    let notify = (cfg.output.notify && !args.no_notify) || save_error.is_some();
+    let wants_post = edit || notify;
     let keep_png = match &payload {
         Payload::Png(png) if wants_post => Some(png.clone()),
         _ => None,
     };
-    let thumb = (cfg.output.notify && !edit && keep_png.is_some() && saved.is_none())
-        .then(|| notify::thumb(&crop));
+    let thumb =
+        (notify && !edit && keep_png.is_some() && saved.is_none()).then(|| notify::thumb(&crop));
     let words = words_for(&payload, saved.as_deref(), save_error.as_deref());
     drop(crop);
 
@@ -249,7 +251,7 @@ fn run(args: &Args, cfg: &Config) -> Result<bool, String> {
         image: saved.clone().map(notify::Image::File).or(thumb),
         path: saved,
         edit,
-        notify: cfg.output.notify || save_error.is_some(),
+        notify,
     });
     Ok(true)
 }

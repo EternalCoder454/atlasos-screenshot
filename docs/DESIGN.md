@@ -2,28 +2,44 @@
 
 ## What it is
 
-A single-shot CLI, bound to Meta+Shift+S. It freezes the screen, the user
-drags a region, and the result goes to the clipboard. There is no window,
-tray, daemon or toolkit. Spectacle stays for Print, recording and annotation.
+The screenshot tool of Telamon OS, a replacement for Spectacle without screen
+recording. A single-shot CLI: one command per capture, no tray, no daemon, no
+toolkit. It captures (the whole desktop, a screen, a window, or a region
+dragged on the frozen desktop), saves a PNG, puts the picture on the clipboard
+and shows a notification with buttons. The one window is the annotation
+editor, a separate Qt program (`editor/`), so the lean path never loads Qt.
+
+Shortcuts (Spectacle's, with its desktop-action ids so a shortcut a user
+changed there can move over by name): Print runs the default mode, Shift+Print
+`--full`, Meta+Print `--active-window`, Meta+Shift+Print and Meta+Shift+S
+`--region`, Meta+Ctrl+Print `--window`.
 
 ## Data flow
 
 ```
-main ── Session::connect (Wayland, xdg-output layout)
-     ── capture_workspace ── KWin ScreenShot2 (D-Bus, pipe fd)
-     │                     └ else ext-image-copy-capture / wlr-screencopy per output, composed
-     │   => Frame { RGBA image of the whole layout, bounds, scale = max output scale }
-     ── overlay::select (layer-shell per output; dimmed frame, selection repainted in place)
-     │   => (Rect in logical coords, Mods at release) | cancel
-     ── drop Wayland connection
-     ── Frame::crop
-     ── mode: Image -> PNG | Ctrl: models::ensure -> ocrs -> text | Alt: ocrs lines -> regex -> opaque boxes -> PNG
-     ── optional save (only with output.save_dir)
-     ── clipboard::copy (prepare, then fork a detached server)
+main ── cli::parse_args ── config::load
+     ── single_instance lock (not for --region X,Y,WxH)
+     ── countdown::wait(--delay)          layer-shell badge; destroyed and answered before the capture
+     ── capture, by kind:
+     │    region   Session::connect ── capture_workspace (KWin ScreenShot2, else ext-image-copy-capture
+     │             / wlr-screencopy per output, composed) ── overlay::select ── Frame::crop
+     │    full / screen / active-window / window
+     │             capture::grab ── KWin CaptureWorkspace / CaptureActiveScreen / CaptureActiveWindow /
+     │             CaptureInteractive(window); full also works through the Wayland protocols
+     ── mode: Image -> PNG | Text (Ctrl, --mode text): models::ensure -> ocrs -> text
+     │       | Redact (Alt): ocrs lines -> regex -> opaque boxes -> PNG
+     ── store::save_png    (Image and Redact; not with --no-save or output.save = false)
+     ── clipboard::copy    (prepare, then fork a detached server)
+     ── post::finish       (fork a detached child: the notification and its buttons, or the editor)
 ```
 
-The frame is taken once, before the overlay maps, and every mode crops from
-it, so "what you saw is what you get" holds for every backend.
+For a region the frame is taken once, before the overlay maps, and every mode
+crops from it, so "what you saw is what you get" holds for every backend.
+Screens and windows are KWin's own pictures at native resolution, with the
+cursor, window frame and window shadow chosen by `--cursor`, `--no-frame`,
+`--no-shadow` (config: `capture.*`); the pointer's screen and windows need
+KWin, and on other compositors `--screen` is every screen and `--window`
+reports that it needs KWin.
 
 ## Threading
 
@@ -42,9 +58,20 @@ connections are closed. The child:
   empty clipboard. The clipboard is live during that wait; only the
   process exit is later.
 
-Only one overlay runs at a time. It holds a `flock` on
-`$XDG_RUNTIME_DIR/telamon-screenshot.lock`, so a second hotkey press only
-notifies that one is in progress; `--region` skips the lock.
+Only one capture runs at a time (the delay and the window picker included).
+It holds a `flock` on `$XDG_RUNTIME_DIR/telamon-screenshot.lock`, so a second
+hotkey press only notifies that one is in progress; `--region X,Y,WxH` skips
+the lock. The lock is released before the clipboard and notification
+children are forked, and they close every inherited descriptor.
+
+`post::finish` forks one more detached child (like the clipboard server, after
+all connections and threads of the parent are gone). It opens its own D-Bus
+connection, subscribes to the notification server's signals, sends the
+notification, and serves `ActionInvoked` until the notification is closed
+other than by expiring (an expired one is still in Plasma's history), or five
+minutes pass. With `--edit` it only starts the editor. The parent returns
+as soon as the clipboard is set, so `$(telamon-screenshot ...)` gets the saved
+path at once.
 
 ## Privilege and attack surface
 
@@ -64,7 +91,21 @@ notifies that one is in progress; `--region` skips the lock.
   stock Plasma, and KWin's grant is by path, so the binary in root-owned
   `/usr/bin` can't be swapped. Accepted as parity.
 - **Notifications.** The body is escaped, because the server may read it as
-  markup.
+  markup. The buttons are a fixed set (`open`, `folder`, `edit`, `copy`, and
+  the body click as `default`); a key the server sends that is not one of them
+  does nothing. They run argument vectors, never a shell: `xdg-open <file>`,
+  `<editor> <file>` (or `-` with the PNG on stdin when nothing was saved),
+  this program with `--copy-png` (PNG on stdin), and the file manager's
+  `ShowItems` with a percent-escaped `file://` URI (else `xdg-open <folder>`).
+  A file name is one argument and one escaped URI, so a hostile name stays a
+  name. Tested in `actions.rs`.
+- **The editor and `org.kde.Spectacle`.** `--save-png` and `--copy-png` read a
+  PNG on stdin (at most 256 MiB, signature checked, at most 16384 pixels a
+  side, decoded header only) so the editor needs no file or clipboard code.
+  `--dbus` owns `org.kde.Spectacle` and answers each method by running this
+  program with fixed flags (the `-1/0/1` arguments choose among them); it
+  takes no path or text from the caller. Any process of the user's could ask
+  for a screenshot over D-Bus; that is what Spectacle's service allows too.
 - **Network.** Only for the models: fixed HTTPS URLs on one host, no
   redirects, rustls with bundled roots. Timeouts are 10 s to connect and
   60 s per file, the body is capped at the expected size + 64 KiB, and there
@@ -73,7 +114,9 @@ notifies that one is in progress; `--region` skips the lock.
   nobody else. Files are opened with `O_NOFOLLOW`, written through a temp file
   with `O_EXCL` + fsync + rename, and the SHA-256 is checked on every load, on
   the same bytes that are then parsed.
-- **Saved screenshots** (opt-in). Refused in a folder other users can write
+- **Saved screenshots.** Saved by default in `Pictures/Screenshots` (found
+  from `user-dirs.dirs` without running `xdg-user-dir`, made if missing), or
+  `output.save_dir`. Refused in a folder other users can write
   to: world-writable, or group-writable by a group other than the user's
   own (unless it has the sticky bit). The file is written unnamed
   (`O_TMPFILE`, 0600) and linked in under its final name with `linkat`,
@@ -132,6 +175,14 @@ zero residual, on entry and on exit.
 | Bad config | Defaults, plus one warning (stderr and notification) |
 | Panic | Notification, exit |
 | Clipboard unavailable | Error, exit 1 |
+| No active window | Error "there is no active window to capture", exit 1 |
+| Window picker cancelled (Escape, right click) | Silent, exit 1 |
+| Window or active screen without KWin | Error saying KWin is needed |
+| No layer-shell for the countdown | The delay still holds, silently |
+| Save fails (read-only, shared folder, no space) | The notification says so, the clipboard still has the picture |
+| No notification server | Nothing is shown; the captured path is still printed |
+| Editor missing | The Edit button does nothing; `--edit` leaves the picture saved |
+| `org.kde.Spectacle` already owned | `--dbus` exits with that error |
 
 Every error goes to stderr and to a desktop notification. The app runs from
 a hotkey, so stderr alone would be invisible.

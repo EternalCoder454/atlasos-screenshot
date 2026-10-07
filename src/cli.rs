@@ -25,6 +25,7 @@ Options:
                    (e-mail, IP and MAC addresses covered)
   --no-save        copy only; keep nothing on disk (output.save = false does
                    this for every shot)
+  --no-notify      no notification after the capture (errors are still shown)
   --edit           open the editor with the picture
   --cursor, --no-cursor    with or without the pointer
   --no-frame       windows without their title bar and borders
@@ -51,6 +52,7 @@ pub struct Args {
     pub region: Option<Rect>,
     pub delay: u32,
     pub no_save: bool,
+    pub no_notify: bool,
     pub edit: bool,
     pub cursor: Option<bool>,
     pub frame: Option<bool>,
@@ -68,6 +70,8 @@ pub enum Action {
     CopyPng,
     /// Serve `org.kde.Spectacle`.
     Dbus,
+    /// The notification and editor helper a capture starts (job on stdin).
+    Post,
 }
 
 pub const MAX_DELAY: u32 = 600;
@@ -95,6 +99,7 @@ pub fn parse_args(it: impl Iterator<Item = String>) -> Result<Action, String> {
             "--save-png" => return only(&mut it, "--save-png", Action::SavePng),
             "--copy-png" => return only(&mut it, "--copy-png", Action::CopyPng),
             "--dbus" => return only(&mut it, "--dbus", Action::Dbus),
+            "--post" => return only(&mut it, "--post", Action::Post),
             "-f" | "--full" => set_kind(&mut args, Kind::Full)?,
             "-m" | "--screen" => set_kind(&mut args, Kind::Screen)?,
             "-a" | "--active-window" => set_kind(&mut args, Kind::ActiveWindow)?,
@@ -129,6 +134,7 @@ pub fn parse_args(it: impl Iterator<Item = String>) -> Result<Action, String> {
                 args.mode = Some(Mode::parse(&v).ok_or_else(|| format!("unknown mode {v:?}"))?);
             }
             "--no-save" => args.no_save = true,
+            "--no-notify" => args.no_notify = true,
             "--edit" => args.edit = true,
             "--cursor" => args.cursor = Some(true),
             "--no-cursor" => args.cursor = Some(false),
@@ -248,12 +254,13 @@ mod tests {
         let a = run(&[
             "--window",
             "--no-save",
+            "--no-notify",
             "--edit",
             "--no-cursor",
             "--no-frame",
             "--shadow",
         ]);
-        assert!(a.no_save && a.edit);
+        assert!(a.no_save && a.no_notify && a.edit);
         assert_eq!(a.cursor, Some(false));
         assert_eq!(a.frame, Some(false));
         assert_eq!(a.shadow, Some(true));
@@ -266,6 +273,7 @@ mod tests {
         assert_eq!(parse(&["--save-png"]).unwrap(), Action::SavePng);
         assert_eq!(parse(&["--copy-png"]).unwrap(), Action::CopyPng);
         assert_eq!(parse(&["--dbus"]).unwrap(), Action::Dbus);
+        assert_eq!(parse(&["--post"]).unwrap(), Action::Post);
         assert!(parse(&["--dbus", "--full"]).is_err());
         assert!(parse(&["--save-png", "x.png"]).is_err());
         assert!(parse(&["shot.png"]).is_err());

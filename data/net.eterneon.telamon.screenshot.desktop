@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
-Name=Screenshot Region
+Name=Screenshot
 GenericName=Screenshot Tool
-Comment=Copy part of the screen as an image, as text (Ctrl) or redacted (Alt)
+Comment=Take screenshots of the screen, a window or a region, and copy the text or cover the secrets in them
 Icon=applets-screenshooter
 # KWin grants org.kde.KWin.ScreenShot2 to the binary this Exec names: keep it
 # the absolute path the RPM installs.
@@ -10,6 +10,39 @@ Exec=/usr/bin/telamon-screenshot
 Terminal=false
 StartupNotify=false
 Categories=Utility;
-Keywords=screenshot;screen;capture;ocr;text;redact;clipboard;
+# "spectacle" and "snip" so a search for either finds it.
+Keywords=screenshot;screen capture;capture;print screen;spectacle;snip;snipping tool;ocr;text;redact;annotate;clipboard;
+Actions=FullScreenScreenShot;CurrentMonitorScreenShot;ActiveWindowScreenShot;RectangularRegionScreenShot;WindowUnderCursorScreenShot;OpenWithoutScreenshot;
 X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2
-X-KDE-Shortcuts=Meta+Shift+S
+# What a bare "telamon-screenshot" takes is capture.default_mode (a region).
+X-KDE-Shortcuts=Print
+
+# The action names and shortcuts are Spectacle's, with the same ids, so a
+# shortcut a user changed in Spectacle can move over by name.
+[Desktop Action FullScreenScreenShot]
+Name=Capture Entire Desktop
+Exec=/usr/bin/telamon-screenshot --full
+X-KDE-Shortcuts=Shift+Print
+
+[Desktop Action CurrentMonitorScreenShot]
+Name=Capture Current Monitor
+Exec=/usr/bin/telamon-screenshot --screen
+
+[Desktop Action ActiveWindowScreenShot]
+Name=Capture Active Window
+Exec=/usr/bin/telamon-screenshot --active-window
+X-KDE-Shortcuts=Meta+Print
+
+[Desktop Action RectangularRegionScreenShot]
+Name=Capture Rectangular Region
+Exec=/usr/bin/telamon-screenshot --region
+X-KDE-Shortcuts=Meta+Shift+Print,Meta+Shift+S
+
+[Desktop Action WindowUnderCursorScreenShot]
+Name=Capture Window Under Cursor
+Exec=/usr/bin/telamon-screenshot --window
+X-KDE-Shortcuts=Meta+Ctrl+Print
+
+[Desktop Action OpenWithoutScreenshot]
+Name=Open the Editor
+Exec=/usr/bin/telamon-screenshot-editor
