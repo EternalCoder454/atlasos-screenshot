@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Screenshot Editor
+GenericName=Image Annotation
+Comment=Draw arrows, boxes, text and numbers on a screenshot, crop it, redact it
+Icon=applets-screenshooter
+Exec=/usr/bin/telamon-screenshot-editor %f
+Terminal=false
+StartupNotify=true
+StartupWMClass=net.eterneon.telamon.screenshot.editor
+Categories=Graphics;Utility;
+MimeType=image/png;image/jpeg;image/webp;image/bmp;image/gif;
+Keywords=screenshot;annotate;crop;redact;arrow;markup;
