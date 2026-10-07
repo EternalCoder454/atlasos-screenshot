@@ -18,6 +18,8 @@ mod wl;
 
 use image::RgbaImage;
 
+use crate::modes::Kind;
+
 pub use wl::Session;
 
 /// A rectangle in logical, global compositor coordinates.
@@ -149,6 +151,8 @@ pub enum CaptureError {
     Unavailable(String),
     /// It exists but failed: report this.
     Failed(String),
+    /// The user backed out of KWin's window picker.
+    Cancelled,
 }
 
 /// Captures the whole workspace with the first backend that's available.
@@ -172,6 +176,7 @@ pub fn capture_workspace(session: &mut Session, include_cursor: bool) -> Result<
             return Ok(frame);
         }
         Err(CaptureError::Failed(e)) => Some(e),
+        Err(CaptureError::Cancelled) => Some("the screenshot was cancelled".into()),
         Err(CaptureError::Unavailable(why)) => {
             skipped.push(why);
             None
@@ -180,6 +185,7 @@ pub fn capture_workspace(session: &mut Session, include_cursor: bool) -> Result<
     match session.capture_outputs(include_cursor) {
         Ok(shots) => compose(shots, bounds, outputs),
         Err(CaptureError::Failed(e)) => Err(kwin_error.unwrap_or(e)),
+        Err(CaptureError::Cancelled) => Err(kwin_error.unwrap_or_default()),
         Err(CaptureError::Unavailable(why)) => Err(kwin_error.unwrap_or_else(|| {
             skipped.push(why);
             format!(
@@ -220,6 +226,53 @@ fn snap_scale(scale: f64) -> f64 {
         snapped
     } else {
         scale
+    }
+}
+
+/// What `grab` takes.
+#[derive(Debug, Clone, Copy)]
+pub struct GrabOpts {
+    pub cursor: bool,
+    pub frame: bool,
+    pub shadow: bool,
+}
+
+/// One picture of a part of the desktop, with no overlay: every screen, the
+/// screen the pointer is on, the active window, or a window the user clicks.
+/// `Ok(None)`: the user backed out of the picker.
+///
+/// Windows and the active screen are KWin's to give (`ScreenShot2`). Every
+/// screen also works through the Wayland capture protocols; on those
+/// compositors the pointer's screen is every screen.
+pub fn grab(kind: Kind, o: GrabOpts) -> Result<Option<RgbaImage>, String> {
+    let opts = kwin::Opts {
+        cursor: o.cursor,
+        frame: o.frame,
+        shadow: o.shadow,
+    };
+    let (target, fallback) = match kind {
+        Kind::Full => (kwin::Target::Workspace, true),
+        Kind::Screen => (kwin::Target::ActiveScreen, true),
+        Kind::ActiveWindow => (kwin::Target::ActiveWindow, false),
+        Kind::Window => (kwin::Target::PickWindow, false),
+        Kind::Region => return Err("a region is selected on a frozen frame".into()),
+    };
+    let reason = match kwin::capture(target, opts) {
+        Ok(image) => return Ok(Some(image)),
+        Err(CaptureError::Cancelled) => return Ok(None),
+        Err(CaptureError::Failed(e)) => e,
+        Err(CaptureError::Unavailable(why)) => format!("KWin isn't available ({why})"),
+    };
+    if !fallback {
+        return Err(format!(
+            "{reason}; capturing a window needs KWin (Plasma). Use --full or --region here"
+        ));
+    }
+    let mut session = Session::connect()?;
+    match capture_workspace(&mut session, o.cursor) {
+        Ok(frame) => Ok(Some(frame.image)),
+        Err(e) if e.is_empty() => Err(reason),
+        Err(e) => Err(e),
     }
 }
 

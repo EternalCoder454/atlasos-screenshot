@@ -1,77 +1,55 @@
-//! telamon-screenshot: freeze the screen, drag a region, get it on the
-//! clipboard. The modifier held when the drag ends picks what you get:
+//! telamon-screenshot: a screenshot tool for Telamon OS, the replacement for
+//! Spectacle. It captures the whole desktop, one screen, a window, or a region
+//! you drag on the frozen desktop, saves the picture in Pictures/Screenshots,
+//! copies it to the clipboard and tells you with a notification (Open, Show in
+//! Folder, Edit, Copy). The modifier held when a region drag ends picks what
+//! you get:
 //!
-//! | Drag        | Clipboard                                        |
+//! | Drag        | Result                                           |
 //! |-------------|--------------------------------------------------|
-//! | plain       | `image/png` of the region                        |
-//! | Ctrl        | `text/plain`: the text OCR reads in the region   |
+//! | plain       | `image/png` of the region, saved and copied      |
+//! | Ctrl        | `text/plain`: the text OCR reads, copied         |
 //! | Alt         | `image/png` with e-mails, IPs and MACs covered   |
+//! | Shift       | the plain picture, opened in the editor          |
 //!
-//! Data flow: capture (one frozen frame) -> overlay (selection + mode) ->
-//! crop -> mode -> optional save (only if configured) -> clipboard.
+//! Data flow: delay (countdown) -> capture (a frozen frame for regions, or
+//! KWin's picture of a screen or window) -> overlay (region + modifiers) ->
+//! mode -> save -> clipboard -> notification or editor (a detached child).
 
+mod actions;
 mod capture;
+mod cli;
 mod clipboard;
 mod config;
+mod countdown;
+mod dbus;
 mod legacy;
 #[cfg(feature = "ocr")]
 mod models;
+mod modes;
 mod notify;
 mod ocr;
 mod overlay;
+mod post;
 mod redact;
+mod store;
 mod watchdog;
 
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::rc::Rc;
 
-use capture::Rect;
+use capture::GrabOpts;
+use cli::{Action, Args, USAGE};
 use clipboard::Payload;
 use config::Config;
-
-const USAGE: &str = "\
-Usage: telamon-screenshot [--mode image|text|redact] [--region X,Y,WxH]
-
-Freezes the screen and copies the region you drag to the clipboard.
-Hold Ctrl when releasing for the text in it (OCR), or Alt for the image
-with e-mail, IP and MAC addresses covered. Escape cancels.
-
-  --mode MODE      what a plain drag (or --region) copies: image (default),
-                   text or redact
-  --region X,Y,WxH skip the overlay and take this region, in logical
-                   desktop coordinates
-  -h, --help       show this help
-  -V, --version    show the version
-
-Exit status: 0 copied, 1 cancelled or failed, 2 bad arguments.
-Config: ~/.config/telamon-screenshot/config.toml";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    Image,
-    Text,
-    Redact,
-}
-
-#[derive(Debug, Default, PartialEq)]
-struct Args {
-    mode: Option<Mode>,
-    region: Option<Rect>,
-}
-
-#[derive(Debug, PartialEq)]
-enum Action {
-    Run(Args),
-    Help,
-    Version,
-}
+use modes::{Kind, Mode};
 
 fn main() -> ExitCode {
-    let action = match parse_args(std::env::args().skip(1)) {
+    let action = match cli::parse_args(std::env::args().skip(1)) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("telamon-screenshot: {e}\n\n{USAGE}");
@@ -87,7 +65,8 @@ fn main() -> ExitCode {
             println!("telamon-screenshot {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
         }
-        Action::Run(args) => args,
+        Action::Run(args) => Some(args),
+        Action::SavePng | Action::CopyPng | Action::Dbus => None,
     };
 
     // Descriptors 0-2 must be taken, or a socket opened later could land
@@ -121,7 +100,11 @@ fn main() -> ExitCode {
     if let Some(w) = warning {
         notify::show(&w);
     }
-    match run(&args, &cfg) {
+    let result = match args {
+        Some(args) => run(&args, &cfg),
+        None => helper(&cfg),
+    };
+    match result {
         Ok(true) => ExitCode::SUCCESS,
         // Cancelled: silent.
         Ok(false) => ExitCode::from(1),
@@ -132,9 +115,61 @@ fn main() -> ExitCode {
     }
 }
 
+/// `--save-png`, `--copy-png` and `--dbus`: the editor's and the D-Bus
+/// service's way in. Errors are plain lines on stderr (the callers show
+/// them), not notifications.
+fn helper(cfg: &Config) -> Result<bool, String> {
+    let action = cli::parse_args(std::env::args().skip(1))?;
+    match action {
+        Action::Dbus => dbus::serve().map(|()| true),
+        Action::SavePng => {
+            let png = read_png(std::io::stdin().lock())?;
+            let path = save_capture(&png, cfg)?;
+            println!("{}", path.display());
+            Ok(true)
+        }
+        Action::CopyPng => {
+            let png = read_png(std::io::stdin().lock())?;
+            clipboard::copy(Payload::Png(png))?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// The biggest PNG taken from stdin.
+const MAX_STDIN_PNG: u64 = 256 * 1024 * 1024;
+
+/// A PNG from `input`, checked: the signature, and a size that is a screen's
+/// and not a bomb's. The bytes are kept as they are.
+fn read_png(input: impl Read) -> Result<Vec<u8>, String> {
+    use image::ImageDecoder;
+
+    let mut png = Vec::new();
+    input
+        .take(MAX_STDIN_PNG + 1)
+        .read_to_end(&mut png)
+        .map_err(|e| format!("can't read the picture: {e}"))?;
+    if png.len() as u64 > MAX_STDIN_PNG {
+        return Err("the picture is too large".into());
+    }
+    let dec = image::codecs::png::PngDecoder::new(std::io::Cursor::new(&png))
+        .map_err(|_| "that is not a PNG picture".to_string())?;
+    let (w, h) = dec.dimensions();
+    if w == 0 || h == 0 || w > 16384 || h > 16384 {
+        return Err(format!("a {w}x{h} picture is too large"));
+    }
+    Ok(png)
+}
+
 /// `Ok(false)` when the user cancelled.
 fn run(args: &Args, cfg: &Config) -> Result<bool, String> {
-    // One overlay at a time: a second press while one is up does nothing.
+    let kind = if args.region.is_some() {
+        Kind::Region
+    } else {
+        args.kind.unwrap_or(cfg.capture.default_mode)
+    };
+    // One capture at a time: a second press while one is up does nothing.
     let _lock = match args.region {
         Some(_) => None,
         None => match single_instance() {
@@ -145,38 +180,13 @@ fn run(args: &Args, cfg: &Config) -> Result<bool, String> {
             }
         },
     };
-    let watchdog = watchdog::Watchdog::arm(
-        std::time::Duration::from_secs(45),
-        "the screen couldn't be captured",
-    );
-    let mut session = capture::Session::connect()?;
-    let frame = Rc::new(capture::capture_workspace(
-        &mut session,
-        cfg.capture.include_cursor,
-    )?);
-    drop(watchdog);
+    countdown::wait(args.delay, cfg.accent_rgb());
 
-    let (rect, mode) = match args.region {
-        Some(r) => (r, args.mode.unwrap_or(Mode::Image)),
-        None => {
-            let style = overlay::Style {
-                dim: cfg.overlay.dim,
-                accent: cfg.accent_rgb(),
-            };
-            match overlay::select(session.connection(), Rc::clone(&frame), style)? {
-                None => return Ok(false),
-                Some((r, m)) => (r, mode_for(m, args.mode)),
-            }
-        }
+    let Some((mut crop, mods)) = capture_picture(kind, args, cfg)? else {
+        return Ok(false);
     };
-    // Close the Wayland connection now: the clipboard server is forked off
-    // later and must not inherit it.
-    drop(session);
-
-    let mut crop = frame
-        .crop(&rect)
-        .ok_or("the selection is outside every screen")?;
-    drop(frame);
+    let mode = mode_for(mods, args.mode);
+    let edit = args.edit || mods.shift;
 
     // Too small to hold a line of text (and below what the models take).
     let readable = crop.width() >= MIN_OCR_PX && crop.height() >= MIN_OCR_PX;
@@ -207,14 +217,134 @@ fn run(args: &Args, cfg: &Config) -> Result<bool, String> {
             Payload::Png(encode_png(&crop)?)
         }
     };
-    if let (Payload::Png(png), Some(dir)) = (&payload, &cfg.output.save_dir)
-        && let Err(e) = save_png(dir, png)
-    {
-        // The copy still happens; only the saved file is missing.
-        notify::show(&e);
-    }
+
+    // Saved first: a failed save is reported, and the copy still happens.
+    let want_save = cfg.output.save && !args.no_save;
+    let (saved, save_error) = match &payload {
+        Payload::Png(png) if want_save => match save_capture(png, cfg) {
+            Ok(path) => (Some(path), None),
+            Err(e) => (None, Some(e)),
+        },
+        _ => (None, None),
+    };
+    let wants_post = edit || cfg.output.notify || save_error.is_some();
+    let keep_png = match &payload {
+        Payload::Png(png) if wants_post => Some(png.clone()),
+        _ => None,
+    };
+    let thumb = (cfg.output.notify && !edit && keep_png.is_some() && saved.is_none())
+        .then(|| notify::thumb(&crop));
+    let words = words_for(&payload, saved.as_deref(), save_error.as_deref());
+    drop(crop);
+
     clipboard::copy(payload)?;
+    if let Some(path) = &saved {
+        // For scripts: where it went.
+        println!("{}", path.display());
+    }
+    post::finish(post::Done {
+        title: words.0,
+        body: words.1,
+        png: keep_png,
+        image: saved.clone().map(notify::Image::File).or(thumb),
+        path: saved,
+        edit,
+        notify: cfg.output.notify || save_error.is_some(),
+    });
     Ok(true)
+}
+
+/// The notification's title and body.
+fn words_for(
+    payload: &Payload,
+    saved: Option<&Path>,
+    save_error: Option<&str>,
+) -> (String, String) {
+    match (payload, saved, save_error) {
+        (Payload::Text(t), _, _) => (
+            "Text Copied".into(),
+            format!("{} characters are on the clipboard.", t.chars().count()),
+        ),
+        (_, Some(path), _) => (
+            "Screenshot Saved".into(),
+            format!(
+                "{}\nIt is also on the clipboard.",
+                path.file_name()
+                    .map(|n| n.to_string_lossy())
+                    .unwrap_or_default()
+            ),
+        ),
+        (_, None, Some(e)) => (
+            "Screenshot Copied".into(),
+            format!("It is on the clipboard, but it couldn't be saved: {e}"),
+        ),
+        (_, None, None) => ("Screenshot Copied".into(), "It is on the clipboard.".into()),
+    }
+}
+
+/// Saves into the configured folder, making the default one when it is
+/// missing. The path of the new file.
+fn save_capture(png: &[u8], cfg: &Config) -> Result<PathBuf, String> {
+    let dir = store::save_dir(cfg).ok_or("there is no home folder to save in")?;
+    store::ensure_default_dir(&dir, cfg)
+        .map_err(|e| format!("can't make {}: {e}", dir.display()))?;
+    store::save_png(&dir, png)
+}
+
+/// Takes the picture. `Ok(None)`: cancelled. The modifiers are the ones held
+/// when a region was released.
+fn capture_picture(
+    kind: Kind,
+    args: &Args,
+    cfg: &Config,
+) -> Result<Option<(image::RgbaImage, overlay::Mods)>, String> {
+    let cursor = args.cursor.unwrap_or(cfg.capture.include_cursor);
+    if kind != Kind::Region {
+        let _watchdog = (!kind.interactive()).then(|| {
+            watchdog::Watchdog::arm(
+                std::time::Duration::from_secs(45),
+                "the screen couldn't be captured",
+            )
+        });
+        let shot = capture::grab(
+            kind,
+            GrabOpts {
+                cursor,
+                frame: args.frame.unwrap_or(cfg.capture.window_frame),
+                shadow: args.shadow.unwrap_or(cfg.capture.window_shadow),
+            },
+        )?;
+        return Ok(shot.map(|img| (img, overlay::Mods::default())));
+    }
+
+    let watchdog = watchdog::Watchdog::arm(
+        std::time::Duration::from_secs(45),
+        "the screen couldn't be captured",
+    );
+    let mut session = capture::Session::connect()?;
+    let frame = Rc::new(capture::capture_workspace(&mut session, cursor)?);
+    drop(watchdog);
+
+    let (rect, mods) = match args.region {
+        Some(r) => (r, overlay::Mods::default()),
+        None => {
+            let style = overlay::Style {
+                dim: cfg.overlay.dim,
+                accent: cfg.accent_rgb(),
+            };
+            match overlay::select(session.connection(), Rc::clone(&frame), style)? {
+                None => return Ok(None),
+                Some(sel) => sel,
+            }
+        }
+    };
+    // Close the Wayland connection now: the clipboard server is forked off
+    // later and must not inherit it.
+    drop(session);
+    let crop = frame
+        .crop(&rect)
+        .ok_or("the selection is outside every screen")?;
+    Ok(Some((crop, mods)))
 }
 
 const MIN_OCR_PX: u32 = 8;
@@ -314,246 +444,9 @@ fn encode_png(img: &image::RgbaImage) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// `Screenshot_<local time>.png` in `dir`, never replacing a file that's
-/// there. The file is made unnamed (`O_TMPFILE`) and linked in under its
-/// final name, so no half-written or temp file is ever visible. Where that
-/// can't work (no `O_TMPFILE`, no /proc), a random temp name is renamed.
-fn save_png(dir: &Path, png: &[u8]) -> Result<PathBuf, String> {
-    use rustix::fs::{Mode, OFlags};
-
-    let fail = |e: std::io::Error| format!("can't save the screenshot in {}: {e}", dir.display());
-    let dfd = rustix::fs::open(
-        dir,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|e| fail(e.into()))?;
-    let st = rustix::fs::fstat(&dfd).map_err(|e| fail(e.into()))?;
-    // Others able to write here (without the sticky bit) could swap files.
-    // Group write is fine for the user's own (private) group.
-    let sticky = st.st_mode & 0o1000 != 0;
-    let foreign_group = st.st_gid != rustix::process::getegid().as_raw();
-    if !sticky && (st.st_mode & 0o002 != 0 || (st.st_mode & 0o020 != 0 && foreign_group)) {
-        return Err(format!(
-            "can't save the screenshot in {}: other users can write to it",
-            dir.display()
-        ));
-    }
-    let stamp = local_stamp(std::time::SystemTime::now());
-    let names: Vec<String> = (0..100)
-        .map(|n| match n {
-            0 => format!("Screenshot_{stamp}.png"),
-            n => format!("Screenshot_{stamp}-{n}.png"),
-        })
-        .collect();
-    let saved = match save_unnamed(&dfd, png, &names) {
-        Ok(Some(name)) => Ok(Some(name)),
-        Ok(None) => save_renamed(&dfd, png, &names),
-        Err(e) => Err(e),
-    }
-    .map_err(fail)?;
-    let _ = rustix::fs::fsync(&dfd);
-    match saved {
-        Some(name) => Ok(dir.join(name)),
-        None => Err(format!(
-            "can't save the screenshot in {}: too many with the same time",
-            dir.display()
-        )),
-    }
-}
-
-fn write_synced(fd: rustix::fd::OwnedFd, png: &[u8]) -> std::io::Result<()> {
-    let mut f = std::fs::File::from(fd);
-    f.write_all(png)?;
-    f.sync_all()
-}
-
-const SAVE_MODE: rustix::fs::Mode = rustix::fs::Mode::RUSR.union(rustix::fs::Mode::WUSR);
-
-/// `O_TMPFILE` + `linkat`. `Ok(None)` (before anything is visible) when the
-/// file system or a missing /proc rules it out.
-fn save_unnamed(
-    dfd: &rustix::fd::OwnedFd,
-    png: &[u8],
-    names: &[String],
-) -> std::io::Result<Option<String>> {
-    use rustix::fs::{AtFlags, OFlags};
-    use rustix::io::Errno;
-
-    let flags = OFlags::WRONLY | OFlags::CLOEXEC | OFlags::TMPFILE;
-    let fd = match rustix::fs::openat(dfd, ".", flags, SAVE_MODE) {
-        Ok(fd) => fd,
-        Err(Errno::OPNOTSUPP | Errno::ISDIR | Errno::INVAL) => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    let proc_path = format!("/proc/self/fd/{}", rustix::fd::AsRawFd::as_raw_fd(&fd));
-    write_synced(rustix::io::dup(&fd)?, png)?;
-    for name in names {
-        match rustix::fs::linkat(
-            rustix::fs::CWD,
-            &proc_path,
-            dfd,
-            name,
-            AtFlags::SYMLINK_FOLLOW,
-        ) {
-            Ok(()) => return Ok(Some(name.clone())),
-            Err(Errno::EXIST) => continue,
-            Err(Errno::NOENT | Errno::PERM | Errno::NOSYS) => return Ok(None),
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Err(std::io::Error::other("too many with the same time"))
-}
-
-/// A random temp name, renamed without replacing. `Ok(None)`: no free name.
-fn save_renamed(
-    dfd: &rustix::fd::OwnedFd,
-    png: &[u8],
-    names: &[String],
-) -> std::io::Result<Option<String>> {
-    use rustix::fs::{AtFlags, OFlags};
-    use std::hash::{BuildHasher, Hasher};
-
-    let r = std::hash::RandomState::new().build_hasher().finish();
-    let tmp = format!(".telamon-screenshot-{r:016x}.tmp");
-    let flags = OFlags::WRONLY | OFlags::CLOEXEC | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW;
-    let fd = rustix::fs::openat(dfd, &tmp, flags, SAVE_MODE)?;
-    let result = write_synced(fd, png).and_then(|()| {
-        for name in names {
-            match rustix::fs::renameat_with(
-                dfd,
-                &tmp,
-                dfd,
-                name,
-                rustix::fs::RenameFlags::NOREPLACE,
-            ) {
-                Ok(()) => return Ok(Some(name.clone())),
-                Err(rustix::io::Errno::EXIST) => continue,
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Ok(None)
-    });
-    if !matches!(result, Ok(Some(_))) {
-        let _ = rustix::fs::unlinkat(dfd, &tmp, AtFlags::empty());
-    }
-    result
-}
-
-/// The time on the user's clock (the UTC stamp shifted by the local offset).
-fn local_stamp(t: std::time::SystemTime) -> String {
-    let secs = t
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    let now = secs as libc::time_t;
-    // SAFETY: localtime_r only writes the `tm` we own.
-    let off = if unsafe { libc::localtime_r(&now, &mut tm) }.is_null() {
-        0
-    } else {
-        tm.tm_gmtoff
-    };
-    utc_stamp(std::time::UNIX_EPOCH + std::time::Duration::from_secs((secs + off).max(0) as u64))
-}
-
-/// `2026-10-05_17-40-12` (UTC), from the civil-from-days algorithm.
-fn utc_stamp(t: std::time::SystemTime) -> String {
-    let secs = t
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let (days, rem) = (secs.div_euclid(86400), secs.rem_euclid(86400));
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    format!(
-        "{y:04}-{m:02}-{d:02}_{:02}-{:02}-{:02}",
-        rem / 3600,
-        rem % 3600 / 60,
-        rem % 60
-    )
-}
-
-fn parse_args(mut it: impl Iterator<Item = String>) -> Result<Action, String> {
-    let mut args = Args::default();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "-h" | "--help" => return Ok(Action::Help),
-            "-V" | "--version" => return Ok(Action::Version),
-            "--mode" => {
-                let v = it.next().ok_or("--mode needs a value")?;
-                args.mode = Some(match v.as_str() {
-                    "image" => Mode::Image,
-                    "text" => Mode::Text,
-                    "redact" => Mode::Redact,
-                    _ => return Err(format!("unknown mode {v:?}")),
-                });
-            }
-            "--region" => {
-                let v = it.next().ok_or("--region needs a value")?;
-                args.region = Some(
-                    parse_region(&v)
-                        .ok_or_else(|| format!("bad region {v:?}, expected X,Y,WxH"))?,
-                );
-            }
-            _ => return Err(format!("unknown argument {a:?}")),
-        }
-    }
-    Ok(Action::Run(args))
-}
-
-/// `X,Y,WxH` (grim/slurp style), bounded to sane desktop sizes.
-fn parse_region(s: &str) -> Option<Rect> {
-    let (x, rest) = s.split_once(',')?;
-    let (y, size) = rest.split_once(',')?;
-    let (w, h) = size.split_once('x')?;
-    let num = |v: &str, lo: i32| {
-        v.trim()
-            .parse::<i32>()
-            .ok()
-            .filter(|n| (lo..=65535).contains(n))
-    };
-    Some(Rect::new(
-        num(x, -65535)?,
-        num(y, -65535)?,
-        num(w, 1)?,
-        num(h, 1)?,
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn parse(v: &[&str]) -> Result<Action, String> {
-        parse_args(v.iter().map(|s| s.to_string()))
-    }
-
-    #[test]
-    fn arguments() {
-        assert_eq!(parse(&[]).unwrap(), Action::Run(Args::default()));
-        assert_eq!(parse(&["--help", "--bogus"]).unwrap(), Action::Help);
-        assert_eq!(
-            parse(&["--mode", "text", "--region", "-10,20,300x40"]).unwrap(),
-            Action::Run(Args {
-                mode: Some(Mode::Text),
-                region: Some(Rect::new(-10, 20, 300, 40))
-            })
-        );
-        assert!(parse(&["--mode"]).is_err());
-        assert!(parse(&["--mode", "ocr"]).is_err());
-        assert!(parse(&["--region", "1,2,0x5"]).is_err());
-        assert!(parse(&["--region", "1,2,3"]).is_err());
-        assert!(parse(&["--region", "1,2,99999x5"]).is_err());
-        assert!(parse(&["shot.png"]).is_err());
-    }
 
     #[test]
     fn either_lock_name_keeps_a_second_instance_out() {
@@ -589,104 +482,49 @@ mod tests {
     #[test]
     fn modifiers_pick_the_mode() {
         use overlay::Mods;
-        assert_eq!(
-            mode_for(
-                Mods {
-                    ctrl: false,
-                    alt: false
-                },
-                None
-            ),
-            Mode::Image
-        );
-        assert_eq!(
-            mode_for(
-                Mods {
-                    ctrl: false,
-                    alt: false
-                },
-                Some(Mode::Redact)
-            ),
-            Mode::Redact
-        );
-        assert_eq!(
-            mode_for(
-                Mods {
-                    ctrl: true,
-                    alt: false
-                },
-                None
-            ),
-            Mode::Text
-        );
-        assert_eq!(
-            mode_for(
-                Mods {
-                    ctrl: false,
-                    alt: true
-                },
-                Some(Mode::Text)
-            ),
-            Mode::Redact
-        );
-        assert_eq!(
-            mode_for(
-                Mods {
-                    ctrl: true,
-                    alt: true
-                },
-                None
-            ),
-            Mode::Text
-        );
+        let m = |ctrl, alt| Mods {
+            ctrl,
+            alt,
+            shift: false,
+        };
+        assert_eq!(mode_for(m(false, false), None), Mode::Image);
+        assert_eq!(mode_for(m(false, false), Some(Mode::Redact)), Mode::Redact);
+        assert_eq!(mode_for(m(true, false), None), Mode::Text);
+        assert_eq!(mode_for(m(false, true), Some(Mode::Text)), Mode::Redact);
+        assert_eq!(mode_for(m(true, true), None), Mode::Text);
     }
 
     #[test]
-    fn timestamps() {
-        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_791_250_812);
-        assert_eq!(utc_stamp(t), "2026-10-06_01-40-12");
-        assert_eq!(utc_stamp(std::time::UNIX_EPOCH), "1970-01-01_00-00-00");
-    }
-
-    #[test]
-    fn png_round_trip_and_save_never_overwrites() {
+    fn png_round_trip() {
         let img = image::RgbaImage::from_pixel(3, 2, image::Rgba([1, 2, 3, 255]));
         let png = encode_png(&img).unwrap();
         assert_eq!(image::load_from_memory(&png).unwrap().to_rgba8(), img);
+    }
 
-        let dir =
-            std::env::temp_dir().join(format!("telamon-screenshot-save-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let a = save_png(&dir, &png).unwrap();
-        let b = save_png(&dir, &png).unwrap();
-        assert_ne!(a, b);
-        assert_eq!(std::fs::read(&a).unwrap(), png);
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+    #[test]
+    fn stdin_pictures_are_checked() {
+        let img = image::RgbaImage::from_pixel(3, 2, image::Rgba([1, 2, 3, 255]));
+        let png = encode_png(&img).unwrap();
+        assert_eq!(read_png(&png[..]).unwrap(), png);
+        assert!(read_png(&b"GIF89a"[..]).is_err());
+        assert!(read_png(&b""[..]).is_err());
+        // Too wide for a screen: refused.
+        let wide = encode_png(&image::RgbaImage::new(16385, 1)).unwrap();
+        assert!(read_png(&wide[..]).unwrap_err().contains("too large"));
+    }
 
-        // A folder others can write to (no sticky bit) is refused.
-        let open = dir.join("open");
-        std::fs::create_dir(&open).unwrap();
-        std::fs::set_permissions(&open, std::os::unix::fs::PermissionsExt::from_mode(0o777))
-            .unwrap();
-        assert!(save_png(&open, &png).unwrap_err().contains("other users"));
-        // Group write in the user's own group is fine (umask 002).
-        std::fs::set_permissions(&open, std::os::unix::fs::PermissionsExt::from_mode(0o775))
-            .unwrap();
-        assert!(save_png(&open, &png).is_ok());
-        // Both ways of saving leave exactly the file.
-        let names = vec!["x.png".to_string()];
-        let dfd = rustix::fs::open(
-            &open,
-            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
-            rustix::fs::Mode::empty(),
-        )
-        .unwrap();
-        assert_eq!(
-            save_renamed(&dfd, &png, &names).unwrap().as_deref(),
-            Some("x.png")
-        );
-        assert_eq!(save_renamed(&dfd, &png, &names).unwrap(), None);
-        assert_eq!(std::fs::read_dir(&open).unwrap().count(), 2);
-        std::fs::remove_dir_all(&dir).unwrap();
+    #[test]
+    fn notification_words() {
+        let png = Payload::Png(vec![]);
+        let (t, b) = words_for(&png, Some(Path::new("/p/Screenshot_1.png")), None);
+        assert_eq!(t, "Screenshot Saved");
+        assert!(b.starts_with("Screenshot_1.png"));
+        let (t, b) = words_for(&png, None, Some("no room"));
+        assert_eq!(t, "Screenshot Copied");
+        assert!(b.contains("no room"));
+        assert_eq!(words_for(&png, None, None).0, "Screenshot Copied");
+        let (t, b) = words_for(&Payload::Text("héllo".into()), None, None);
+        assert_eq!(t, "Text Copied");
+        assert!(b.starts_with("5 characters"));
     }
 }

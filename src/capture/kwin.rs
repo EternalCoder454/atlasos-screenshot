@@ -22,43 +22,107 @@ const DEST: &str = "org.kde.KWin";
 const PATH: &str = "/org/kde/KWin/ScreenShot2";
 const IFACE: &str = "org.kde.KWin.ScreenShot2";
 const TIMEOUT: Duration = Duration::from_secs(10);
+/// KWin's picker waits for the user's click.
+const PICK_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Which of ScreenShot2's captures to ask for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    /// `CaptureWorkspace`: every screen, one image.
+    Workspace,
+    /// `CaptureActiveScreen`: the screen the pointer is on.
+    ActiveScreen,
+    /// `CaptureActiveWindow`: the window that has the focus.
+    ActiveWindow,
+    /// `CaptureInteractive` (window): KWin lets the user click one.
+    PickWindow,
+}
+
+/// What a capture includes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Opts {
+    pub cursor: bool,
+    /// Window title bar and borders (windows only).
+    pub frame: bool,
+    /// Window shadow (windows only).
+    pub shadow: bool,
+}
 
 pub fn capture_workspace(include_cursor: bool) -> Result<RgbaImage, CaptureError> {
-    capture(None, include_cursor)
+    capture(
+        Target::Workspace,
+        Opts {
+            cursor: include_cursor,
+            frame: true,
+            shadow: false,
+        },
+    )
 }
 
 /// One output (by its name) in its own pixels, as KWin put it on screen.
 pub fn capture_screen(name: &str, include_cursor: bool) -> Result<RgbaImage, CaptureError> {
-    capture(Some(name), include_cursor)
+    run(
+        Target::Workspace,
+        Some(name),
+        Opts {
+            cursor: include_cursor,
+            frame: true,
+            shadow: false,
+        },
+    )
 }
 
-fn capture(screen: Option<&str>, include_cursor: bool) -> Result<RgbaImage, CaptureError> {
+/// The `a{sv}` options of a call. Native resolution always: the picture is
+/// the pixels the screen shows. `hide-caller-windows` keeps anything of ours
+/// (the countdown, if it were still up) out of the picture.
+fn options(target: Target, o: Opts) -> HashMap<&'static str, Value<'static>> {
+    let mut options: HashMap<&str, Value> = HashMap::new();
+    options.insert("include-cursor", Value::from(o.cursor));
+    options.insert("native-resolution", Value::from(true));
+    options.insert("hide-caller-windows", Value::from(true));
+    if matches!(target, Target::ActiveWindow | Target::PickWindow) {
+        options.insert("include-decoration", Value::from(o.frame));
+        options.insert("include-shadow", Value::from(o.shadow));
+    }
+    options
+}
+
+pub fn capture(target: Target, opts: Opts) -> Result<RgbaImage, CaptureError> {
+    run(target, None, opts)
+}
+
+/// `screen`: `CaptureScreen` of that output, instead of `target`.
+fn run(target: Target, screen: Option<&str>, opts: Opts) -> Result<RgbaImage, CaptureError> {
+    let timeout = if target == Target::PickWindow {
+        PICK_TIMEOUT
+    } else {
+        TIMEOUT
+    };
     let conn = zbus::blocking::connection::Builder::session()
-        .and_then(|b| b.method_timeout(TIMEOUT).build())
+        .and_then(|b| b.method_timeout(timeout).build())
         .map_err(|e| CaptureError::Unavailable(format!("no D-Bus session bus: {e}")))?;
 
     let (read_end, write_end) = pipe_with(PipeFlags::CLOEXEC)
         .map_err(|e| CaptureError::Failed(format!("can't create a pipe: {e}")))?;
 
-    let mut options: HashMap<&str, Value> = HashMap::new();
-    options.insert("include-cursor", Value::from(include_cursor));
-    options.insert("native-resolution", Value::from(true));
-
-    let reply = match screen {
-        None => conn.call_method(
-            Some(DEST),
-            PATH,
-            Some(IFACE),
-            "CaptureWorkspace",
-            &(options, Fd::from(write_end.as_fd())),
-        ),
-        Some(name) => conn.call_method(
-            Some(DEST),
-            PATH,
-            Some(IFACE),
-            "CaptureScreen",
-            &(name, options, Fd::from(write_end.as_fd())),
-        ),
+    let options = options(target, opts);
+    let fd = Fd::from(write_end.as_fd());
+    let reply = if let Some(name) = screen {
+        conn.call_method(Some(DEST), PATH, Some(IFACE), "CaptureScreen", &(name, options, fd))
+    } else {
+        let member = match target {
+            Target::Workspace => "CaptureWorkspace",
+            Target::ActiveScreen => "CaptureActiveScreen",
+            Target::ActiveWindow => "CaptureActiveWindow",
+            Target::PickWindow => "CaptureInteractive",
+        };
+        match target {
+            // kind 0: a window (1 would be a screen).
+            Target::PickWindow => {
+                conn.call_method(Some(DEST), PATH, Some(IFACE), member, &(0u32, options, fd))
+            }
+            _ => conn.call_method(Some(DEST), PATH, Some(IFACE), member, &(options, fd)),
+        }
     };
     // KWin holds its own copy now; ours must close or we never see EOF.
     drop(write_end);
@@ -89,6 +153,12 @@ fn classify(e: zbus::Error) -> CaptureError {
             return CaptureError::Unavailable(format!(
                 "KWin's screenshot service isn't running ({name})"
             ));
+        }
+        if name.ends_with(".Error.Cancelled") {
+            return CaptureError::Cancelled;
+        }
+        if name.ends_with(".Error.NoActiveWindow") {
+            return CaptureError::Failed("there is no active window to capture".into());
         }
         if name.ends_with(".NoAuthorized") || name.ends_with(".AccessDenied") {
             return CaptureError::Failed(
@@ -266,6 +336,26 @@ mod tests {
             ("format", u(6)),
         ]);
         assert!(Meta::parse(&wrong_type).is_err());
+    }
+
+    #[test]
+    fn options_by_target() {
+        let o = Opts {
+            cursor: true,
+            frame: false,
+            shadow: true,
+        };
+        let ws = options(Target::Workspace, o);
+        assert_eq!(bool::try_from(&ws["include-cursor"]), Ok(true));
+        assert_eq!(bool::try_from(&ws["native-resolution"]), Ok(true));
+        assert!(!ws.contains_key("include-decoration") && !ws.contains_key("include-shadow"));
+        for t in [Target::ActiveWindow, Target::PickWindow] {
+            let w = options(t, o);
+            assert_eq!(bool::try_from(&w["include-decoration"]), Ok(false));
+            assert_eq!(bool::try_from(&w["include-shadow"]), Ok(true));
+            assert_eq!(bool::try_from(&w["hide-caller-windows"]), Ok(true));
+        }
+        assert!(!options(Target::ActiveScreen, o).contains_key("include-shadow"));
     }
 
     #[test]
