@@ -14,6 +14,14 @@ changed there can move over by name): Print runs the default mode, Shift+Print
 `--full`, Meta+Print `--active-window`, Meta+Shift+Print and Meta+Shift+S
 `--region`, Meta+Ctrl+Print `--window`.
 
+Print takes a region because that is what Spectacle's does: its Print key
+runs a bare `spectacle`, and Spectacle 6.7's `launchAction` defaults to
+`TakeRectangularScreenshot` (spectacle.kcfg, v6.7.2). Two defaults differ on
+purpose: Spectacle saves and copies only on request (`autoSaveImage=false`,
+`clipboardGroup=PostScreenshotDoNothing`) and opens its window; this tool
+saves to the same folder (`Pictures/Screenshots`, `Screenshot_<date>_<time>`)
+and copies at once, then notifies, and has no window until Edit.
+
 ## Data flow
 
 ```

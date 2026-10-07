@@ -15,7 +15,7 @@ The same as Spectacle's, shipped in the `.desktop` file so KDE picks them up:
 
 | Key               | What                                                          |
 |-------------------|---------------------------------------------------------------|
-| Print             | what `capture.default_mode` says (a region, by default)       |
+| Print             | what `capture.default_mode` says (a region, by default, as Spectacle's Print) |
 | Shift+Print       | the whole desktop (every screen), as one picture              |
 | Meta+Print        | the active window                                             |
 | Meta+Shift+Print  | a region (also **Meta+Shift+S**, the original snip key)       |
