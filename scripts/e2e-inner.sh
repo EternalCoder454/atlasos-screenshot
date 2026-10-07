@@ -28,7 +28,7 @@ if [ "${1:-}" != --in-session ]; then
         rm -f /usr/share/dbus-1/services/org.kde.spectacle.service
         # Stand-ins for what the notification buttons start.
         mkdir -p /usr/local/bin
-        install -m755 /dev/stdin /usr/local/bin/xdg-open <<'STUB'
+        install -m755 /dev/stdin /usr/bin/xdg-open <<'STUB'
 #!/bin/sh
 echo "$*" >>/out/xdg-open.log
 STUB
@@ -55,6 +55,8 @@ servers() { pgrep -f '^/usr/bin/telamon-screenshot|^telamon-screenshot' | tr '\n
 kwin=$!
 for _ in $(seq 60); do [ -S "$XDG_RUNTIME_DIR/wl-test" ] && break; sleep 0.25; done
 export WAYLAND_DISPLAY=wl-test QT_QPA_PLATFORM=wayland
+# Programs the bus starts (org.kde.Spectacle) get the session's environment, as under Plasma.
+dbus-update-activation-environment WAYLAND_DISPLAY XDG_DATA_HOME XDG_CONFIG_HOME XDG_RUNTIME_DIR HOME 2>/dev/null
 kscreen-doctor output.Virtual-0.scale.1.5 >/dev/null 2>&1
 sleep 1
 kdialog --title "E2E" --msgbox "Mail zach@example.com from 192.168.1.20 now" >/dev/null 2>&1 &
@@ -174,11 +176,11 @@ print(v if not isinstance(v, (list, dict)) else json.dumps(v))
 PY
     }
     shot() { # args...: runs a capture, path (if saved) in $f, waits for its notification
-        n0=$(nn)
+        nn0=$(nn)
         f=$($S "$@" 2>/tmp/shot.err); rc=$?
         waitfor 8 notified
     }
-    notified() { [ "$(nn)" -gt "$n0" ]; }
+    notified() { [ "$(nn)" -gt "$nn0" ]; }
     click() { echo "$1" >"$MOCK_ACTION_FILE"; waitfor 5 test ! -s "$MOCK_ACTION_FILE"; }
     # Same pixels? (the clipboard against a file)
     clip_is() { wl-paste -t image/png >/tmp/clip.png && cmp -s /tmp/clip.png "$1"; }
@@ -221,14 +223,9 @@ import sys
 from PIL import Image
 im = Image.open("/out/window.png")
 sys.exit(0 if im.mode == "RGBA" and im.getchannel("A").getextrema()[0] < 255 else 1)'; echo $?)
-    n0=$(pngs)
-    timeout 4 $S --window; rc=$?
-    check "window: waits for a click in KWin's picker" $([ $rc = 124 ]; echo $?)
-    check "window: nothing saved when not picked" $([ "$(pngs)" = "$n0" ]; echo $?)
-    shot --full
-    check "after the picker: capturing still works" $rc
-
-    # --- region without the overlay, and clicking the buttons
+    # --- region without the overlay, and clicking the buttons. A click closes
+    # the notification and the helper that serves it ends, so each button gets
+    # a capture (and a notification) of its own.
     shot --region 0,0,640x400
     check "region: exit 0, 960x600" $([ $rc = 0 ] && [ "$(png_size "$f")" = 960x600 ]; echo $?)
     rf=$f
@@ -236,12 +233,21 @@ sys.exit(0 if im.mode == "RGBA" and im.getchannel("A").getextrema()[0] < 255 els
     click copy
     waitfor 5 clip_is "$rf"
     check "button Copy: the picture is on the clipboard again" $?
+    shot --region 0,0,640x400
+    rf=$f
+    : >/out/xdg-open.log
     click open
     waitfor 5 grep -qxF "$rf" /out/xdg-open.log
     check "button Open: xdg-open gets the file as one argument" $?
+    shot --region 0,0,640x400
+    rf=$f
+    show_items() { grep -F '"kind": "show-items"' /out/notify.log | grep -qF "\"file://$rf\""; }
     click folder
-    waitfor 5 grep -qF "\"file://$rf\"" /out/notify.log
+    waitfor 5 show_items
     check "button Show in Folder: FileManager1.ShowItems gets the file's URI" $?
+    shot --region 0,0,640x400
+    rf=$f
+    : >/out/editor.log
     click edit
     waitfor 5 grep -qxF "$rf" /out/editor.log
     check "button Edit: the editor gets the file" $?
@@ -261,6 +267,7 @@ sys.exit(0 if 0 < d["w"] <= 320 and 0 < d["h"] <= 320 and d["bytes"] == d["w"] *
     click edit
     waitfor 5 test -s /out/editor-stdin.png
     check "no-save, button Edit: the editor gets the picture on stdin" $(cmp -s /out/editor-stdin.png /tmp/clip.png; echo $?)
+    shot --full --no-save
     wl-copy other; sleep 0.5
     click copy
     waitfor 5 clip_is /tmp/clip.png
@@ -369,6 +376,53 @@ PY
     two_taken() { [ "$(grep -c ScreenshotTaken /out/spectacle-signals.log)" -ge 2 ]; }
     waitfor 15 two_taken
     check "Spectacle D-Bus: ActiveWindow(0,0,0) answers too" $?
+
+    # --- the real editor, from the CLI, in this session: the stub is replaced
+    # by the editor's test build, which grabs its own window to a PNG once it
+    # has drawn (a wrapper adds the flags; the CLI starts it as it does the
+    # installed one, with the file or "-" and the picture on stdin).
+    if [ -x /in/editor-test ]; then
+        install -m755 /dev/stdin /usr/bin/telamon-screenshot-editor <<'WRAP'
+#!/bin/sh
+case "$1" in -) out=/out/editor-real-stdin.png ;; "") out=/out/editor-real-empty.png ;; *) out=/out/editor-real-file.png ;; esac
+exec /in/editor-test --screenshot "$out" --wait 1500 "$@"
+WRAP
+        rm -f /out/editor-real-*.png
+        /usr/bin/telamon-screenshot-editor >/dev/null 2>&1 &
+        waitfor 30 test -s /out/editor-real-empty.png
+        check "editor: opens empty, in this session" $?
+        $S --region 0,0,640x400 --edit --no-save --no-notify >/dev/null; rc=$?
+        check "editor, stdin round trip: --region --edit --no-save exits 0 at once" $rc
+        waitfor 30 test -s /out/editor-real-stdin.png
+        check "editor, stdin round trip: the editor opened and drew its window" $?
+        f=$($S --region 0,0,640x400 --edit --no-notify); rc=$?
+        waitfor 30 test -s /out/editor-real-file.png
+        check "editor, file: --region --edit opens the saved file" $?
+        python3 - >/out/editor-real-compare.txt <<'PY'
+from PIL import Image, ImageChops
+e = Image.open("/out/editor-real-empty.png").convert("RGB")
+for n in ("stdin", "file"):
+    i = Image.open(f"/out/editor-real-{n}.png").convert("RGB")
+    d = ImageChops.difference(e, i.resize(e.size)) if i.size != e.size else ImageChops.difference(e, i)
+    print(n, i.size[0], i.size[1], "differs-from-empty", sum(1 for px in d.getdata() if px != (0, 0, 0)))
+PY
+        cat /out/editor-real-compare.txt
+        for n in stdin file; do
+            check "editor, $n: the window shows the picture (not the empty state)" \
+                $([ "$(awk -v n=$n '$1==n {print $5}' /out/editor-real-compare.txt)" -gt 5000 ]; echo $?)
+        done
+    else
+        echo "SKIP the real editor (no /in/editor-test)"
+    fi
+    # --- the window picker, last: killed while it waits, KWin leaves its
+    # "select window" message up until someone clicks, and it would be in every
+    # picture after.
+    n0=$(pngs)
+    timeout 4 $S --window; rc=$?
+    check "window: waits for a click in KWin's picker" $([ $rc = 124 ]; echo $?)
+    check "window: nothing saved when not picked" $([ "$(pngs)" = "$n0" ]; echo $?)
+    shot --full
+    check "after the picker: capturing still works" $rc
     kill $mon 2>/dev/null
     kill $mock 2>/dev/null
 else
