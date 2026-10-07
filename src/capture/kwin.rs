@@ -73,7 +73,7 @@ fn classify(e: zbus::Error) -> CaptureError {
         }
         if name.ends_with(".NoAuthorized") || name.ends_with(".AccessDenied") {
             return CaptureError::Failed(
-                "KWin refused the screenshot: atlasos-screenshot must run from /usr/bin, as installed by its package"
+                "KWin refused the screenshot: telamon-screenshot must run from /usr/bin, as installed by its package"
                     .into(),
             );
         }

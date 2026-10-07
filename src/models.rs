@@ -1,7 +1,7 @@
 //! The OCR models, downloaded on the first Ctrl or Alt drag.
 //!
 //! This is the one place the tool writes to disk without being configured to
-//! (approved for AtlasOS): `$XDG_DATA_HOME/atlasos-screenshot/models`.
+//! (approved for Telamon OS): `$XDG_DATA_HOME/telamon-screenshot/models`.
 //! - Fixed HTTPS URLs, no redirects, no plain HTTP; nothing comes from config.
 //! - Timeouts (10 s connect, 60 s per file), a size cap, one retry.
 //! - The folder is 0700 and must be ours; files go to a temp name, are
@@ -43,14 +43,17 @@ pub struct Models {
     pub recognition: Vec<u8>,
 }
 
-/// `$XDG_DATA_HOME/atlasos-screenshot/models`, else `~/.local/share/...`.
+/// `$XDG_DATA_HOME/telamon-screenshot/models`, else `~/.local/share/...`.
 pub fn dir() -> Result<PathBuf, String> {
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
         .ok_or("neither XDG_DATA_HOME nor HOME is set")?;
-    Ok(base.join("atlasos-screenshot").join("models"))
+    // Models downloaded by atlasos-screenshot (before 0.2.0) move with their
+    // folder, once. Left in place when that fails: they are downloaded again.
+    let _ = crate::legacy::move_once(&base, true);
+    Ok(base.join(crate::legacy::NAME).join("models"))
 }
 
 /// The models, downloading whichever is missing or damaged. `on_download` is
@@ -167,7 +170,7 @@ fn download(spec: &ModelSpec) -> Result<Vec<u8>, FetchError> {
         .proxy(None)
         .timeout_connect(Some(Duration::from_secs(10)))
         .timeout_global(Some(Duration::from_secs(60)))
-        .user_agent(concat!("atlasos-screenshot/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("telamon-screenshot/", env!("CARGO_PKG_VERSION")))
         .build()
         .into();
     let url = format!("{BASE_URL}{}", spec.file);
@@ -185,7 +188,7 @@ fn download(spec: &ModelSpec) -> Result<Vec<u8>, FetchError> {
         // hash means upstream replaced it, and retrying won't help.
         return Err(if bytes.len() as u64 == spec.size {
             FetchError::Fatal(
-                "the model on the server has changed; atlasos-screenshot needs an update".into(),
+                "the model on the server has changed; telamon-screenshot needs an update".into(),
             )
         } else {
             FetchError::Transient("the download was incomplete".into())
@@ -316,7 +319,7 @@ mod tests {
 
     fn tmpdir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
-            "atlasos-screenshot-models-{tag}-{}",
+            "telamon-screenshot-models-{tag}-{}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&d);
@@ -332,7 +335,7 @@ mod tests {
 
     #[test]
     fn store_then_read_back_and_detect_damage() {
-        let d = tmpdir("store").join("atlasos-screenshot").join("models");
+        let d = tmpdir("store").join("telamon-screenshot").join("models");
         prepare_dir(&d).unwrap();
         assert_eq!(
             fs::metadata(&d).unwrap().permissions().mode() & 0o777,
@@ -358,9 +361,23 @@ mod tests {
     }
 
     #[test]
+    fn models_of_the_old_folder_move_and_still_verify() {
+        let root = tmpdir("legacy");
+        let old = root.join(crate::legacy::OLD_NAME).join("models");
+        prepare_dir(&old).unwrap();
+        store(&old, &TINY, b"abc").unwrap();
+
+        assert!(crate::legacy::move_once(&root, true).unwrap());
+        let new = root.join(crate::legacy::NAME).join("models");
+        assert_eq!(read_verified(&new, &TINY).unwrap().unwrap(), b"abc");
+        assert!(!root.join(crate::legacy::OLD_NAME).exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn refuses_shared_or_symlinked_folders() {
         let root = tmpdir("perm");
-        let d = root.join("atlasos-screenshot").join("models");
+        let d = root.join("telamon-screenshot").join("models");
         prepare_dir(&d).unwrap();
         fs::set_permissions(&d, fs::Permissions::from_mode(0o777)).unwrap();
         assert!(
@@ -370,7 +387,7 @@ mod tests {
         );
         fs::set_permissions(&d, fs::Permissions::from_mode(0o700)).unwrap();
 
-        let link = root.join("atlasos-screenshot").join("linked");
+        let link = root.join("telamon-screenshot").join("linked");
         std::os::unix::fs::symlink(&d, &link).unwrap();
         assert!(check_dir(&link).is_err());
 
@@ -384,7 +401,7 @@ mod tests {
     #[test]
     fn stale_temps_are_cleaned_but_fresh_ones_kept() {
         let root = tmpdir("stale");
-        let d = root.join("atlasos-screenshot").join("models");
+        let d = root.join("telamon-screenshot").join("models");
         prepare_dir(&d).unwrap();
         let fresh = d.join(".tiny.rten.1.2.tmp");
         fs::write(&fresh, b"x").unwrap();

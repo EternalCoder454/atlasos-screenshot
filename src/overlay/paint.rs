@@ -12,7 +12,7 @@
 
 use crate::capture::{Frame, Rect};
 
-/// Atlas.Ui's `AtlasStyle.radius` and control border width (logical px).
+/// Telamon.Ui's `TelamonStyle.radius` and control border width (logical px).
 const RADIUS: f64 = 6.0;
 const BORDER: f64 = 1.0;
 

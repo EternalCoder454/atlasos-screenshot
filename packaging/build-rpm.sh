@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build the AtlasOS Screenshot RPM inside a fedora:44 container, as root.
+# Build the Telamon Screenshot RPM inside a fedora:44 container, as root.
 #   packaging/build-rpm.sh <out dir> [rpmbuild options]
 # Works from a plain copy of the tree (no .git needed). The binary RPM is
 # copied to <out dir>. Cargo needs network access.
@@ -11,7 +11,7 @@ main() {
 
     here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
     src=$(dirname "$here")
-    spec=$here/atlasos-screenshot.spec
+    spec=$here/telamon-screenshot.spec
     version=$(awk '/^Version:/ {print $2; exit}' "$spec")
 
     dnf -y install rpm-build dnf5-plugins tar gzip >&2
@@ -22,8 +22,8 @@ main() {
     mkdir -p "$top"/{SOURCES,BUILD,RPMS,SRPMS,SPECS}
     tar -C "$src" \
         --exclude=./.git --exclude=./target --exclude=./out --exclude=./build \
-        --transform "s,^\./,atlasos-screenshot-$version/," \
-        -czf "$top/SOURCES/atlasos-screenshot-$version.tar.gz" .
+        --transform "s,^\./,telamon-screenshot-$version/," \
+        -czf "$top/SOURCES/telamon-screenshot-$version.tar.gz" .
 
     rpmbuild -bb "$@" --define "_topdir $top" "$spec"
 

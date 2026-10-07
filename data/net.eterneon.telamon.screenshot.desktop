@@ -6,7 +6,7 @@ Comment=Copy part of the screen as an image, as text (Ctrl) or redacted (Alt)
 Icon=applets-screenshooter
 # KWin grants org.kde.KWin.ScreenShot2 to the binary this Exec names: keep it
 # the absolute path the RPM installs.
-Exec=/usr/bin/atlasos-screenshot
+Exec=/usr/bin/telamon-screenshot
 Terminal=false
 StartupNotify=false
 Categories=Utility;

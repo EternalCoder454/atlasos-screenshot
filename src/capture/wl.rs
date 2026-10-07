@@ -379,7 +379,7 @@ fn pixel_layout(f: wl_shm::Format) -> Option<(bool, bool)> {
 }
 
 /// Undoes the output transform, so the image is the way the user sees it.
-/// Untested on rotated outputs (none on AtlasOS' test hardware).
+/// Untested on rotated outputs (none on Telamon OS' test hardware).
 fn upright(img: RgbaImage, t: wl_output::Transform) -> RgbaImage {
     use image::imageops::{flip_horizontal, rotate90, rotate180, rotate270};
     use wl_output::Transform as T;
@@ -425,7 +425,7 @@ impl ShmBuffer {
                 "the compositor asked for an impossible screenshot buffer ({width}x{height})"
             ));
         }
-        let fd = rustix::fs::memfd_create("atlasos-screenshot", rustix::fs::MemfdFlags::CLOEXEC)
+        let fd = rustix::fs::memfd_create("telamon-screenshot", rustix::fs::MemfdFlags::CLOEXEC)
             .map_err(|e| format!("can't allocate screenshot memory: {e}"))?;
         rustix::fs::ftruncate(&fd, len as u64)
             .map_err(|e| format!("can't allocate screenshot memory: {e}"))?;

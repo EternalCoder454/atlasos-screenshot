@@ -1,4 +1,4 @@
-# AtlasOS Screenshot: design
+# Telamon Screenshot: design
 
 ## What it is
 
@@ -43,13 +43,13 @@ connections are closed. The child:
   process exit is later.
 
 Only one overlay runs at a time. It holds a `flock` on
-`$XDG_RUNTIME_DIR/atlasos-screenshot.lock`, so a second hotkey press only
+`$XDG_RUNTIME_DIR/telamon-screenshot.lock`, so a second hotkey press only
 notifies that one is in progress; `--region` skips the lock.
 
 ## Privilege and attack surface
 
 - **Privilege.** No root and no polkit. KWin grants ScreenShot2 to
-  `/usr/bin/atlasos-screenshot` because the packaged `.desktop` file names it
+  `/usr/bin/telamon-screenshot` because the packaged `.desktop` file names it
   with `X-KDE-DBUS-Restricted-Interfaces`.
 - **Input from KWin.** Image metadata is range-checked (16384² max, stride ≥
   4·width) before it sizes an allocation. Pipe reads are capped to that size,

@@ -1,4 +1,4 @@
-//! atlasos-screenshot: freeze the screen, drag a region, get it on the
+//! telamon-screenshot: freeze the screen, drag a region, get it on the
 //! clipboard. The modifier held when the drag ends picks what you get:
 //!
 //! | Drag        | Clipboard                                        |
@@ -13,6 +13,7 @@
 mod capture;
 mod clipboard;
 mod config;
+mod legacy;
 #[cfg(feature = "ocr")]
 mod models;
 mod notify;
@@ -33,7 +34,7 @@ use clipboard::Payload;
 use config::Config;
 
 const USAGE: &str = "\
-Usage: atlasos-screenshot [--mode image|text|redact] [--region X,Y,WxH]
+Usage: telamon-screenshot [--mode image|text|redact] [--region X,Y,WxH]
 
 Freezes the screen and copies the region you drag to the clipboard.
 Hold Ctrl when releasing for the text in it (OCR), or Alt for the image
@@ -47,7 +48,7 @@ with e-mail, IP and MAC addresses covered. Escape cancels.
   -V, --version    show the version
 
 Exit status: 0 copied, 1 cancelled or failed, 2 bad arguments.
-Config: ~/.config/atlasos-screenshot/config.toml";
+Config: ~/.config/telamon-screenshot/config.toml";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -73,7 +74,7 @@ fn main() -> ExitCode {
     let action = match parse_args(std::env::args().skip(1)) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("atlasos-screenshot: {e}\n\n{USAGE}");
+            eprintln!("telamon-screenshot: {e}\n\n{USAGE}");
             return ExitCode::from(2);
         }
     };
@@ -83,7 +84,7 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Action::Version => {
-            println!("atlasos-screenshot {}", env!("CARGO_PKG_VERSION"));
+            println!("telamon-screenshot {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
         }
         Action::Run(args) => args,
@@ -218,16 +219,43 @@ fn run(args: &Args, cfg: &Config) -> Result<bool, String> {
 
 const MIN_OCR_PX: u32 = 8;
 
-/// An exclusive lock on `$XDG_RUNTIME_DIR/atlasos-screenshot.lock`, or
-/// `None` when another instance holds it. Without a runtime dir (or if the
-/// lock can't be made) there is no guard, rather than no screenshot.
-fn single_instance() -> Option<Option<std::fs::File>> {
+/// Exclusive locks on `$XDG_RUNTIME_DIR/telamon-screenshot.lock` and, for this
+/// release, on `atlasos-screenshot.lock`, which a still running
+/// `atlasos-screenshot` of an earlier version holds: `None` when another
+/// instance holds either. Without a runtime dir (or if a lock can't be made)
+/// there is no guard, rather than no screenshot.
+fn single_instance() -> Option<Vec<std::fs::File>> {
     let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) else {
-        return Some(None);
+        return Some(Vec::new());
     };
     if !dir.is_absolute() {
-        return Some(None);
+        return Some(Vec::new());
     }
+    lock_both(&dir)
+}
+
+fn lock_both(dir: &Path) -> Option<Vec<std::fs::File>> {
+    let mut held = Vec::new();
+    for name in [
+        format!("{}.lock", legacy::NAME),
+        format!("{}.lock", legacy::OLD_NAME),
+    ] {
+        match lock_file(dir, &name) {
+            Lock::Held(f) => held.push(f),
+            Lock::Busy => return None,
+            Lock::Unavailable => {}
+        }
+    }
+    Some(held)
+}
+
+enum Lock {
+    Held(std::fs::File),
+    Busy,
+    Unavailable,
+}
+
+fn lock_file(dir: &Path, name: &str) -> Lock {
     let Ok(file) = OpenOptions::new()
         .read(true)
         .write(true)
@@ -235,14 +263,14 @@ fn single_instance() -> Option<Option<std::fs::File>> {
         .truncate(false)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(dir.join("atlasos-screenshot.lock"))
+        .open(dir.join(name))
     else {
-        return Some(None);
+        return Lock::Unavailable;
     };
     match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => Some(Some(file)),
-        Err(rustix::io::Errno::WOULDBLOCK) => None,
-        Err(_) => Some(None),
+        Ok(()) => Lock::Held(file),
+        Err(rustix::io::Errno::WOULDBLOCK) => Lock::Busy,
+        Err(_) => Lock::Unavailable,
     }
 }
 
@@ -387,7 +415,7 @@ fn save_renamed(
     use std::hash::{BuildHasher, Hasher};
 
     let r = std::hash::RandomState::new().build_hasher().finish();
-    let tmp = format!(".atlasos-screenshot-{r:016x}.tmp");
+    let tmp = format!(".telamon-screenshot-{r:016x}.tmp");
     let flags = OFlags::WRONLY | OFlags::CLOEXEC | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW;
     let fd = rustix::fs::openat(dfd, &tmp, flags, SAVE_MODE)?;
     let result = write_synced(fd, png).and_then(|()| {
@@ -528,6 +556,37 @@ mod tests {
     }
 
     #[test]
+    fn either_lock_name_keeps_a_second_instance_out() {
+        let dir =
+            std::env::temp_dir().join(format!("telamon-screenshot-locks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let first = lock_both(&dir).expect("free");
+        assert_eq!(first.len(), 2, "both names are held");
+        assert!(lock_both(&dir).is_none(), "a second instance is refused");
+        drop(first);
+
+        // An instance of the old name holds only its own lock file.
+        let Lock::Held(old) = lock_file(&dir, "atlasos-screenshot.lock") else {
+            panic!()
+        };
+        assert!(
+            lock_both(&dir).is_none(),
+            "the old name's lock is respected"
+        );
+        drop(old);
+        // And the other way: the new name's lock stops an old one's try.
+        let Lock::Held(new) = lock_file(&dir, "telamon-screenshot.lock") else {
+            panic!()
+        };
+        assert!(lock_both(&dir).is_none());
+        drop(new);
+        assert!(lock_both(&dir).is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn modifiers_pick_the_mode() {
         use overlay::Mods;
         assert_eq!(
@@ -596,7 +655,7 @@ mod tests {
         assert_eq!(image::load_from_memory(&png).unwrap().to_rgba8(), img);
 
         let dir =
-            std::env::temp_dir().join(format!("atlasos-screenshot-save-{}", std::process::id()));
+            std::env::temp_dir().join(format!("telamon-screenshot-save-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let a = save_png(&dir, &png).unwrap();
         let b = save_png(&dir, &png).unwrap();
