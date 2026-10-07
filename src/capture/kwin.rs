@@ -108,7 +108,13 @@ fn run(target: Target, screen: Option<&str>, opts: Opts) -> Result<RgbaImage, Ca
     let options = options(target, opts);
     let fd = Fd::from(write_end.as_fd());
     let reply = if let Some(name) = screen {
-        conn.call_method(Some(DEST), PATH, Some(IFACE), "CaptureScreen", &(name, options, fd))
+        conn.call_method(
+            Some(DEST),
+            PATH,
+            Some(IFACE),
+            "CaptureScreen",
+            &(name, options, fd),
+        )
     } else {
         let member = match target {
             Target::Workspace => "CaptureWorkspace",
