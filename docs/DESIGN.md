@@ -13,7 +13,7 @@ main ── Session::connect (Wayland, xdg-output layout)
      ── capture_workspace ── KWin ScreenShot2 (D-Bus, pipe fd)
      │                     └ else ext-image-copy-capture / wlr-screencopy per output, composed
      │   => Frame { RGBA image of the whole layout, bounds, scale = max output scale }
-     ── overlay::select (layer-shell per output; dimmed frame + selection subsurface)
+     ── overlay::select (layer-shell per output; dimmed frame, selection repainted in place)
      │   => (Rect in logical coords, Mods at release) | cancel
      ── drop Wayland connection
      ── Frame::crop
@@ -110,9 +110,19 @@ a hotkey, so stderr alone would be invisible.
 - **Hotkey to overlay:** under 150 ms at 4K + 1080p.
 - **Release to clipboard (image):** under 300 ms for a full 4K frame (fast
   PNG compression).
-- **Selection redraw:** follows frame callbacks, and only the selection's
-  pixels are redrawn.
+- **Selection redraw:** at most one per frame callback, however fast the
+  pointer moves. Each screen reuses two SHM buffers (a third only if the
+  compositor holds both) and repaints, from a dimmed copy of the frame made
+  once, only the strips the selection's edges crossed since that buffer was
+  last shown; only what changed since the last commit is damaged, and a
+  screen the change doesn't touch isn't committed. A full-screen drag at
+  3840x2160 costs about 0.6 ms of CPU per frame (`redraw_bench`, below),
+  where repainting the whole selection every frame cost 50-70 ms.
 - **Idle CPU:** 0. It blocks in `poll` while waiting for input.
-- **RSS:** about 3× the frame size during selection (frame + dimmed base +
-  selection buffer). OCR adds about 60 MB.
+- **RSS:** about 4× the frame size during selection (frame, and per screen
+  its dimmed copy and two buffers). OCR adds about 60 MB.
 - **Binary:** release, LTO, stripped.
+
+The redraw benchmark replays a two-second full-screen drag at 3840x2160
+(scale 1.7) with the old and the new painting:
+`scripts/dev.sh cargo test --release --locked redraw_bench -- --ignored --nocapture`.

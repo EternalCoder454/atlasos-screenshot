@@ -38,5 +38,6 @@ recording and annotation); bound to Meta+Shift+S through its `.desktop` file.
 | Lint | `scripts/dev.sh cargo clippy --all-targets --locked -- -D warnings` |
 | Tests | `scripts/dev.sh cargo test --locked` |
 | Release build | `scripts/dev.sh cargo build --release --locked` |
+| Redraw benchmark | `scripts/dev.sh cargo test --release --locked redraw_bench -- --ignored --nocapture` |
 | End-to-end (KWin) | `scripts/e2e-kwin.sh` (in `localhost/atlasos:mon7`, see the script) |
 | RPM | `podman run --rm --init --security-opt label=disable -v "$PWD":/src:ro -v <out>:/out -v atlas-cargo:/root/.cargo/registry -e CARGO_HOME=/root/.cargo registry.fedoraproject.org/fedora:44 /src/packaging/build-rpm.sh /out` |

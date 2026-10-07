@@ -1,7 +1,6 @@
 //! The selection overlay: one wlr-layer-shell surface per output, showing the
-//! frozen frame dimmed, with the selection drawn undimmed on a subsurface
-//! inside a rounded border in the Atlas accent. No toolkit; SHM buffers drawn
-//! by hand.
+//! frozen frame dimmed, with the selection undimmed inside a rounded border
+//! in the Atlas accent. No toolkit; SHM buffers drawn by hand (`paint`).
 //!
 //! - Drag with the left button to select; release to finish. The modifiers
 //!   held at release pick the mode (Ctrl: text, Alt: redact).
@@ -10,15 +9,20 @@
 //!
 //! Buffers hold frame pixels 1:1 and `wp_viewporter` maps them onto the
 //! output's logical size, so the frozen image is pixel-exact at any scale.
-//! Redraws follow frame callbacks, so a fast mouse never queues stale frames.
+//! Redraws follow frame callbacks, so a fast mouse never queues stale frames:
+//! all the motion since the last frame becomes one redraw. Each screen
+//! reuses two (at most three) buffers, repaints only the strips the
+//! selection's edges moved across, and damages only those.
+
+mod paint;
 
 use std::rc::Rc;
 
-use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, Region};
+use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
 use smithay_client_toolkit::reexports::client::protocol::{
-    wl_keyboard, wl_output, wl_pointer, wl_seat, wl_subsurface, wl_surface,
+    wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface,
 };
 use smithay_client_toolkit::reexports::client::{Connection, QueueHandle, delegate_noop};
 use smithay_client_toolkit::reexports::protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::{
@@ -36,24 +40,23 @@ use smithay_client_toolkit::shell::wlr_layer::{
 };
 use smithay_client_toolkit::shm::slot::{Buffer, SlotPool};
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
-use smithay_client_toolkit::subcompositor::SubcompositorState;
 use smithay_client_toolkit::{
     delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
-    delegate_seat, delegate_shm, delegate_subcompositor, registry_handlers,
+    delegate_seat, delegate_shm, registry_handlers,
 };
 use wayland_client::protocol::wl_shm;
 
 use crate::capture::{Frame, Rect};
 use crate::watchdog::Watchdog;
+use paint::{Pixels, Rects, Shows};
 
 /// Setup and teardown waits on the compositor (not the user).
 const SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
-
-/// Atlas.Ui's `AtlasStyle.radius` and control border width (logical px).
-const RADIUS: f64 = 6.0;
-const BORDER: f64 = 1.0;
+/// Buffers per screen: one on screen, one being drawn, and a spare for a
+/// compositor slow to release.
+const MAX_BUFFERS: usize = 3;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Style {
@@ -81,8 +84,6 @@ pub fn select(
         format!("the compositor doesn't support {what}, which the selection overlay needs")
     };
     let compositor = CompositorState::bind(&globals, &qh).map_err(|_| missing("wl_compositor"))?;
-    let subcompositor = SubcompositorState::bind(compositor.wl_compositor().clone(), &globals, &qh)
-        .map_err(|_| missing("subsurfaces"))?;
     let layer_shell = LayerShell::bind(&globals, &qh).map_err(|_| missing("wlr-layer-shell"))?;
     let shm = Shm::bind(&globals, &qh).map_err(|_| missing("wl_shm"))?;
     let viewporter: wp_viewporter::WpViewporter = globals
@@ -97,7 +98,6 @@ pub fn select(
         seat_state: SeatState::new(&globals, &qh),
         cursor_shape: CursorShapeManager::bind(&globals, &qh).ok(),
         compositor,
-        subcompositor,
         layer_shell,
         shm,
         viewporter,
@@ -131,6 +131,13 @@ pub fn select(
             setup = None;
         }
         ov.redraw(&qh);
+        if ov.result.is_none() && ov.screens.iter().any(|s| s.slots.len() == 1) {
+            // Send the first frames on their way before the extra work.
+            queue.flush().map_err(|e| lost(&e))?;
+            if let Err(e) = ov.fill_spares() {
+                ov.fail(e);
+            }
+        }
     }
     drop(setup);
     // Tear the overlay down and make sure it's gone from the screen before
@@ -147,14 +154,27 @@ struct Screen {
     geom: Rect,
     layer: LayerSurface,
     viewport: wp_viewport::WpViewport,
-    sel_surface: wl_surface::WlSurface,
-    sel_sub: wl_subsurface::WlSubsurface,
-    sel_viewport: wp_viewport::WpViewport,
-    base: Option<Buffer>,
-    sel: Option<Buffer>,
+    /// This screen's dimmed frame, made at the first configure.
+    pixels: Option<Pixels>,
+    slots: Vec<Slot>,
+    /// The selection the surface shows; `None` until the next commit must
+    /// damage everything (first commit, new size).
+    shown: Option<Option<Rect>>,
     configured: bool,
     waiting_frame: bool,
     dirty: bool,
+}
+
+fn new_buffer<'p>(pool: &'p mut SlotPool, px: &Pixels) -> Result<(Buffer, &'p mut [u8]), String> {
+    let (w, h) = (px.width as i32, px.height as i32);
+    pool.create_buffer(w, h, w * 4, wl_shm::Format::Xrgb8888)
+        .map_err(|e| format!("can't allocate overlay memory: {e}"))
+}
+
+/// A reusable SHM buffer and what it shows.
+struct Slot {
+    buffer: Buffer,
+    shows: Shows,
 }
 
 struct Overlay {
@@ -163,7 +183,6 @@ struct Overlay {
     seat_state: SeatState,
     cursor_shape: Option<CursorShapeManager>,
     compositor: CompositorState,
-    subcompositor: SubcompositorState,
     layer_shell: LayerShell,
     shm: Shm,
     viewporter: wp_viewporter::WpViewporter,
@@ -218,24 +237,14 @@ impl Overlay {
             layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
             layer.set_size(0, 0);
             let viewport = self.viewporter.get_viewport(layer.wl_surface(), qh, ());
-            let (sel_sub, sel_surface) = self
-                .subcompositor
-                .create_subsurface(layer.wl_surface().clone(), qh);
-            let sel_viewport = self.viewporter.get_viewport(&sel_surface, qh, ());
-            // Input goes to the layer surface underneath, never the selection.
-            if let Ok(region) = Region::new(&self.compositor) {
-                sel_surface.set_input_region(Some(region.wl_region()));
-            }
             layer.commit();
             self.screens.push(Screen {
                 geom,
                 layer,
                 viewport,
-                sel_surface,
-                sel_sub,
-                sel_viewport,
-                base: None,
-                sel: None,
+                pixels: None,
+                slots: Vec::new(),
+                shown: None,
                 configured: false,
                 waiting_frame: false,
                 dirty: false,
@@ -304,147 +313,103 @@ impl Overlay {
                 && s.dirty
                 && !s.waiting_frame
                 && self.result.is_none()
-                && let Err(e) = self.draw_selection(i, qh)
+                && let Err(e) = self.draw(i, qh)
             {
                 self.fail(e);
             }
         }
     }
 
-    /// The frozen, dimmed screen. Drawn once per configure.
-    fn draw_base(&mut self, i: usize, size: (u32, u32)) -> Result<(), String> {
-        let frame = Rc::clone(&self.frame);
-        let geom = self.screens[i].geom;
-        let (fx, fy, fw, fh) = frame.pixel_rect(&geom);
-        if fw == 0 || fh == 0 {
-            return Err("a screen lies outside the captured frame".into());
+    /// Brings screen `i` up to date with the selection, in a buffer the
+    /// compositor has released: repaints only what that buffer shows
+    /// differently, and damages only what changed since the last commit.
+    /// Commits nothing when the change doesn't touch this screen.
+    fn draw(&mut self, i: usize, qh: &QueueHandle<Self>) -> Result<(), String> {
+        let want = self.selection().filter(|r| !r.is_empty());
+        let Overlay {
+            pool,
+            screens,
+            frame,
+            ..
+        } = self;
+        let s = &mut screens[i];
+        let Some(px) = &s.pixels else {
+            return Ok(());
+        };
+        let damage = match s.shown {
+            Some(prev) => px.changed(frame, prev, want),
+            None => Rects::one(px.bounds()),
+        };
+        if damage.is_empty() {
+            s.shown = Some(want);
+            s.dirty = false;
+            return Ok(());
         }
-        let (buffer, canvas) = self
-            .pool
-            .create_buffer(
-                fw as i32,
-                fh as i32,
-                fw as i32 * 4,
-                wl_shm::Format::Argb8888,
-            )
-            .map_err(|e| format!("can't allocate overlay memory: {e}"))?;
-        let keep = 1.0 - self.style.dim.clamp(0.0, 0.9);
-        let k = (keep * 256.0) as u32;
-        for y in 0..fh {
-            let src = &frame.image.as_raw()
-                [((fy + y) as usize * frame.image.width() as usize + fx as usize) * 4..]
-                [..fw as usize * 4];
-            let dst = &mut canvas[(y * fw * 4) as usize..][..fw as usize * 4];
-            for (d, s) in dst
-                .as_chunks_mut::<4>()
-                .0
-                .iter_mut()
-                .zip(src.as_chunks::<4>().0)
-            {
-                // Opaque: gaps in the frame show as black.
-                let a = s[3] as u32;
-                let c = |v: u8| (((v as u32 * a / 255) * k) >> 8) as u8;
-                d.copy_from_slice(&[c(s[2]), c(s[1]), c(s[0]), 255]);
+        // Usually the buffer before last: the compositor releases a buffer
+        // once the next one replaces it.
+        let free = s.slots.iter().position(|b| b.buffer.canvas(pool).is_some());
+        let n = match free {
+            Some(n) => n,
+            None if s.slots.len() < MAX_BUFFERS => {
+                let (buffer, _) = new_buffer(pool, px)?;
+                s.slots.push(Slot {
+                    buffer,
+                    shows: Shows::Garbage,
+                });
+                s.slots.len() - 1
             }
-        }
-        let s = &mut self.screens[i];
+            // All in use: the release that frees one wakes the loop, which
+            // tries again (the screen stays dirty).
+            None => return Ok(()),
+        };
+        let slot = &mut s.slots[n];
+        let canvas = slot
+            .buffer
+            .canvas(pool)
+            .ok_or("overlay buffer error: busy")?;
+        px.update(frame, canvas, slot.shows, want);
+        slot.shows = Shows::Selection(want);
         let surface = s.layer.wl_surface();
-        buffer
+        slot.buffer
             .attach_to(surface)
             .map_err(|e| format!("overlay buffer error: {e}"))?;
-        s.viewport.set_destination(size.0 as i32, size.1 as i32);
-        surface.damage_buffer(0, 0, fw as i32, fh as i32);
-        s.base = Some(buffer);
-        s.dirty = true;
-        Ok(())
-    }
-
-    /// The selection: undimmed frame pixels inside a rounded accent border.
-    fn draw_selection(&mut self, i: usize, qh: &QueueHandle<Self>) -> Result<(), String> {
-        let frame = Rc::clone(&self.frame);
-        let geom = self.screens[i].geom;
-        let sel = self.selection().filter(|r| !r.is_empty());
-        let part = sel.and_then(|r| r.intersect(&geom));
-
-        match (sel, part) {
-            (Some(sel), Some(part)) => {
-                let (fx, fy, fw, fh) = frame.pixel_rect(&part);
-                if fw == 0 || fh == 0 {
-                    return Ok(());
-                }
-                let (buffer, canvas) = self
-                    .pool
-                    .create_buffer(
-                        fw as i32,
-                        fh as i32,
-                        fw as i32 * 4,
-                        wl_shm::Format::Argb8888,
-                    )
-                    .map_err(|e| format!("can't allocate overlay memory: {e}"))?;
-                let shape = RoundRect::new(&frame, &sel);
-                let accent = self.style.accent;
-                let img = frame.image.as_raw();
-                let iw = frame.image.width() as usize;
-                for y in 0..fh {
-                    let gy = (fy + y) as f64 + 0.5;
-                    let row = &img[((fy + y) as usize * iw + fx as usize) * 4..][..fw as usize * 4];
-                    let dst = &mut canvas[(y * fw * 4) as usize..][..fw as usize * 4];
-                    for (x, (d, s)) in dst
-                        .as_chunks_mut::<4>()
-                        .0
-                        .iter_mut()
-                        .zip(row.as_chunks::<4>().0)
-                        .enumerate()
-                    {
-                        let gx = (fx as usize + x) as f64 + 0.5;
-                        let (inner, border) = shape.coverage(gx, gy);
-                        let a = s[3] as f64 / 255.0;
-                        // Premultiplied ARGB, little-endian: B, G, R, A.
-                        let mix = |c: u8, acc: u8| {
-                            (c as f64 * a * inner + acc as f64 * border)
-                                .round()
-                                .min(255.0) as u8
-                        };
-                        d.copy_from_slice(&[
-                            mix(s[2], accent[2]),
-                            mix(s[1], accent[1]),
-                            mix(s[0], accent[0]),
-                            ((inner + border) * 255.0).round().min(255.0) as u8,
-                        ]);
-                    }
-                }
-                let s = &mut self.screens[i];
-                s.sel_sub.set_position(part.x - geom.x, part.y - geom.y);
-                s.sel_viewport.set_destination(part.w, part.h);
-                buffer
-                    .attach_to(&s.sel_surface)
-                    .map_err(|e| format!("overlay buffer error: {e}"))?;
-                s.sel_surface.damage_buffer(0, 0, fw as i32, fh as i32);
-                s.sel = Some(buffer);
-            }
-            _ => {
-                let s = &mut self.screens[i];
-                s.sel_surface.attach(None, 0, 0);
-                s.sel = None;
-            }
+        for r in damage.iter() {
+            surface.damage_buffer(r.x, r.y, r.w, r.h);
         }
-        let s = &mut self.screens[i];
-        // The subsurface is synchronised: its state lands with the parent's
-        // commit, together with the new position.
-        s.sel_surface.commit();
-        let surface = s.layer.wl_surface();
         surface.frame(qh, surface.clone());
         s.layer.commit();
+        s.shown = Some(want);
         s.dirty = false;
         s.waiting_frame = true;
         Ok(())
     }
 
+    /// Gives each screen its second buffer, filled, once the first one is
+    /// on screen and before the user starts dragging, so the first frames
+    /// of a drag don't pay for a whole-screen copy.
+    fn fill_spares(&mut self) -> Result<(), String> {
+        let Overlay {
+            pool,
+            screens,
+            frame,
+            ..
+        } = self;
+        for s in screens {
+            let (Some(px), 1, Some(shown)) = (&s.pixels, s.slots.len(), s.shown) else {
+                continue;
+            };
+            let (buffer, canvas) = new_buffer(pool, px)?;
+            px.update(frame, canvas, Shows::Garbage, shown);
+            s.slots.push(Slot {
+                buffer,
+                shows: Shows::Selection(shown),
+            });
+        }
+        Ok(())
+    }
+
     fn destroy(&mut self) {
         for s in self.screens.drain(..) {
-            s.sel_viewport.destroy();
-            s.sel_sub.destroy();
-            s.sel_surface.destroy();
             s.viewport.destroy();
             // LayerSurface destroys itself and its wl_surface on drop.
         }
@@ -457,45 +422,6 @@ impl Overlay {
         if let Some(p) = self.pointer.take() {
             p.release();
         }
-    }
-}
-
-/// The selection's rounded rectangle in frame pixels, as a signed distance
-/// field, for antialiased corners and border.
-struct RoundRect {
-    cx: f64,
-    cy: f64,
-    hw: f64,
-    hh: f64,
-    r: f64,
-    bw: f64,
-}
-
-impl RoundRect {
-    fn new(frame: &Frame, sel: &Rect) -> RoundRect {
-        let s = frame.scale;
-        let x0 = (sel.x - frame.bounds.x) as f64 * s;
-        let y0 = (sel.y - frame.bounds.y) as f64 * s;
-        let (w, h) = (sel.w as f64 * s, sel.h as f64 * s);
-        RoundRect {
-            cx: x0 + w / 2.0,
-            cy: y0 + h / 2.0,
-            hw: w / 2.0,
-            hh: h / 2.0,
-            r: (RADIUS * s).min(w / 2.0).min(h / 2.0),
-            bw: (BORDER * s).round().max(1.0),
-        }
-    }
-
-    /// (coverage of the inside, coverage of the border) at a pixel centre.
-    fn coverage(&self, x: f64, y: f64) -> (f64, f64) {
-        let qx = (x - self.cx).abs() - (self.hw - self.r);
-        let qy = (y - self.cy).abs() - (self.hh - self.r);
-        let outside = qx.max(0.0).hypot(qy.max(0.0));
-        let d = outside + qx.max(qy).min(0.0) - self.r;
-        let outer = (0.5 - d).clamp(0.0, 1.0);
-        let inner = (0.5 - (d + self.bw)).clamp(0.0, 1.0);
-        (inner, outer - inner)
     }
 }
 
@@ -579,24 +505,26 @@ impl LayerShellHandler for Overlay {
         let Some(i) = self.screens.iter().position(|s| &s.layer == layer) else {
             return;
         };
-        let geom = self.screens[i].geom;
+        let s = &mut self.screens[i];
         let size = match cfg.new_size {
-            (0, 0) => (geom.w as u32, geom.h as u32),
-            s => s,
+            (0, 0) => (s.geom.w as u32, s.geom.h as u32),
+            n => n,
         };
-        if self.screens[i].base.is_none() {
-            if let Err(e) = self.draw_base(i, size) {
-                self.fail(e);
+        if s.pixels.is_none() {
+            // The frozen frame, dimmed, once: redraws copy from it.
+            s.pixels = Pixels::new(&self.frame, &s.geom, self.style.dim, self.style.accent);
+            if s.pixels.is_none() {
+                self.fail("a screen lies outside the captured frame".into());
                 return;
             }
-        } else {
-            self.screens[i]
-                .viewport
-                .set_destination(size.0 as i32, size.1 as i32);
         }
-        self.screens[i].configured = true;
-        self.screens[i].waiting_frame = false;
-        self.screens[i].dirty = true;
+        s.viewport.set_destination(size.0 as i32, size.1 as i32);
+        // The next commit (from `redraw`, right after this event) carries
+        // the size, with everything damaged.
+        s.shown = None;
+        s.configured = true;
+        s.waiting_frame = false;
+        s.dirty = true;
     }
 }
 
@@ -787,7 +715,6 @@ impl ProvidesRegistryState for Overlay {
 }
 
 delegate_compositor!(Overlay);
-delegate_subcompositor!(Overlay);
 delegate_output!(Overlay);
 delegate_seat!(Overlay);
 delegate_keyboard!(Overlay);
@@ -797,47 +724,3 @@ delegate_shm!(Overlay);
 delegate_registry!(Overlay);
 delegate_noop!(Overlay: wp_viewporter::WpViewporter);
 delegate_noop!(Overlay: wp_viewport::WpViewport);
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::capture::OutputGeom;
-
-    fn frame(scale: f64) -> Frame {
-        let bounds = Rect::new(0, 0, 100, 100);
-        Frame {
-            image: image::RgbaImage::new((100.0 * scale) as u32, (100.0 * scale) as u32),
-            bounds,
-            scale,
-            outputs: vec![OutputGeom {
-                name: "A".into(),
-                logical: bounds,
-            }],
-        }
-    }
-
-    #[test]
-    fn shape_inside_border_and_corners() {
-        let f = frame(1.5);
-        let sh = RoundRect::new(&f, &Rect::new(10, 10, 40, 20));
-        // Centre: fully inside, no border.
-        assert_eq!(sh.coverage(45.0, 30.0), (1.0, 0.0));
-        // The first pixel row along the top edge is border (1.5 px -> 2 px).
-        let (inner, border) = sh.coverage(45.0, 15.5);
-        assert_eq!((inner, border), (0.0, 1.0));
-        // The very corner pixel is outside the rounded corner.
-        let (inner, border) = sh.coverage(15.5, 15.5);
-        assert_eq!(inner + border, 0.0);
-        // Far outside.
-        assert_eq!(sh.coverage(0.5, 0.5), (0.0, 0.0));
-    }
-
-    #[test]
-    fn tiny_selections_clamp_the_radius() {
-        let f = frame(1.0);
-        let sh = RoundRect::new(&f, &Rect::new(0, 0, 4, 4));
-        assert_eq!(sh.r, 2.0);
-        let (inner, border) = sh.coverage(2.0, 2.0);
-        assert!(inner + border > 0.99);
-    }
-}
