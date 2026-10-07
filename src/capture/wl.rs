@@ -49,6 +49,8 @@ struct OutputData {
     wl: wl_output::WlOutput,
     name: Option<String>,
     transform: wl_output::Transform,
+    /// The current mode, in the output's own (unturned) pixels.
+    mode: Option<(i32, i32)>,
     logical: Option<(i32, i32, i32, i32)>,
     xdg_pos: Option<(i32, i32)>,
     xdg_size: Option<(i32, i32)>,
@@ -97,6 +99,7 @@ impl Session {
                     wl,
                     name: None,
                     transform: wl_output::Transform::Normal,
+                    mode: None,
                     logical: None,
                     xdg_pos: None,
                     xdg_size: None,
@@ -155,6 +158,7 @@ impl Session {
                         .or_else(|| o.xdg_name.clone())
                         .unwrap_or_else(|| format!("output-{i}")),
                     logical: Rect::new(x, y, w, h),
+                    pixels: o.pixels(),
                 })
             })
             .collect())
@@ -395,6 +399,20 @@ fn upright(img: RgbaImage, t: wl_output::Transform) -> RgbaImage {
     }
 }
 
+impl OutputData {
+    /// The mode as the user sees it: turned by the output's transform.
+    fn pixels(&self) -> (u32, u32) {
+        use wl_output::Transform as T;
+        let Some((w, h)) = self.mode.filter(|&(w, h)| w > 0 && h > 0) else {
+            return (0, 0);
+        };
+        match self.transform {
+            T::_90 | T::_270 | T::Flipped90 | T::Flipped270 => (h as u32, w as u32),
+            _ => (w as u32, h as u32),
+        }
+    }
+}
+
 /// A one-off wl_shm buffer over a sealed-size memfd.
 struct ShmBuffer {
     buffer: wl_buffer::WlBuffer,
@@ -505,6 +523,12 @@ impl Dispatch<wl_output::WlOutput, usize> for State {
                 transform: WEnum::Value(t),
                 ..
             } => o.transform = t,
+            wl_output::Event::Mode {
+                flags: WEnum::Value(f),
+                width,
+                height,
+                ..
+            } if f.contains(wl_output::Mode::Current) => o.mode = Some((width, height)),
             wl_output::Event::Name { name } => o.name = Some(name),
             _ => {}
         }

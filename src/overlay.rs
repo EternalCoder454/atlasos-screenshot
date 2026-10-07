@@ -17,6 +17,7 @@
 mod paint;
 
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
@@ -24,7 +25,7 @@ use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
 use smithay_client_toolkit::reexports::client::protocol::{
     wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface,
 };
-use smithay_client_toolkit::reexports::client::{Connection, QueueHandle, delegate_noop};
+use smithay_client_toolkit::reexports::client::{Connection, EventQueue, QueueHandle, delegate_noop};
 use smithay_client_toolkit::reexports::protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::{
     Shape, WpCursorShapeDeviceV1,
 };
@@ -44,6 +45,7 @@ use smithay_client_toolkit::{
     delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
     delegate_seat, delegate_shm, registry_handlers,
 };
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use wayland_client::protocol::wl_shm;
 
 use crate::capture::{Frame, Rect};
@@ -104,6 +106,7 @@ pub fn select(
         pool,
         frame,
         style,
+        hold: entry_hold(),
         screens: Vec::new(),
         keyboard: None,
         pointer: None,
@@ -126,7 +129,8 @@ pub fn select(
     ov.create_screens(&qh)?;
 
     while ov.result.is_none() {
-        queue.blocking_dispatch(&mut ov).map_err(|e| lost(&e))?;
+        let until = ov.next_reveal();
+        dispatch(&mut queue, &mut ov, until).map_err(|e| lost(&e))?;
         if setup.is_some() && ov.screens.iter().any(|s| s.configured) {
             setup = None;
         }
@@ -143,10 +147,126 @@ pub fn select(
     // Tear the overlay down and make sure it's gone from the screen before
     // the caller spends time on OCR or the clipboard.
     let result = ov.result.take().unwrap_or(Ok(None));
+    ov.blank_all();
     ov.destroy();
     let _teardown = Watchdog::arm(SETUP_TIMEOUT, "the selection overlay didn't close");
     queue.roundtrip(&mut ov).map_err(|e| lost(&e))?;
     result
+}
+
+/// How long KWin's open animation (the Scale effect: a fade and a zoom, 160
+/// ms at the default animation speed) has to play out, from the first frame
+/// the compositor shows of the window, before the window can be replaced
+/// without the animation showing; see `show_blank`.
+const KWIN_OPEN_ANIMATION: Duration = Duration::from_millis(180);
+
+/// The longest a screen waits for the compositor's first frame callback
+/// (the sign that the transparent pixel is up and the animation running)
+/// before the hold starts anyway.
+const FIRST_FRAME_WAIT: Duration = Duration::from_millis(250);
+
+/// Zero on any compositor but KWin, or when KWin has no such effect loaded
+/// or animations are off. `TELAMON_HOLD_MS` overrides it (for tests).
+fn entry_hold() -> Duration {
+    if let Some(ms) = std::env::var("TELAMON_HOLD_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        return Duration::from_millis(ms.min(1000));
+    }
+    if !kwin_animates_new_windows() {
+        return Duration::ZERO;
+    }
+    KWIN_OPEN_ANIMATION.mul_f64(animation_factor())
+}
+
+/// Asks KWin which effects are loaded. Anything but "KWin isn't there, or
+/// has neither effect" counts as yes: a pause is cheaper than the glitch.
+fn kwin_animates_new_windows() -> bool {
+    let call = || -> zbus::Result<Vec<String>> {
+        let conn = zbus::blocking::connection::Builder::session()?
+            .method_timeout(Duration::from_millis(500))
+            .build()?;
+        let reply = conn.call_method(
+            Some("org.kde.KWin"),
+            "/Effects",
+            Some("org.freedesktop.DBus.Properties"),
+            "Get",
+            &("org.kde.kwin.Effects", "loadedEffects"),
+        )?;
+        let v: zbus::zvariant::OwnedValue = reply.body().deserialize()?;
+        Vec::<String>::try_from(v).map_err(zbus::Error::from)
+    };
+    match call() {
+        Ok(effects) => effects.iter().any(|e| e == "scale" || e == "fade"),
+        Err(zbus::Error::MethodError(name, ..)) => !matches!(
+            name.as_str(),
+            "org.freedesktop.DBus.Error.ServiceUnknown"
+                | "org.freedesktop.DBus.Error.NameHasNoOwner"
+        ),
+        // No session bus: no KWin to talk to either.
+        Err(zbus::Error::InputOutput(_)) => false,
+        Err(_) => true,
+    }
+}
+
+/// Plasma's "animation speed" (`AnimationDurationFactor` in kdeglobals):
+/// 1 is normal, larger is slower, 0 turns animations off.
+fn animation_factor() -> f64 {
+    use std::io::Read;
+    let dir = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".config")));
+    let Some(path) = dir.map(|d| d.join("kdeglobals")) else {
+        return 1.0;
+    };
+    let mut text = String::new();
+    let read = std::fs::File::open(path).and_then(|f| f.take(65536).read_to_string(&mut text));
+    if read.is_err() {
+        return 1.0;
+    }
+    let mut in_kde = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_kde = line == "[KDE]";
+        } else if in_kde && let Some(v) = line.strip_prefix("AnimationDurationFactor=") {
+            return v
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|f| f.is_finite())
+                .map_or(1.0, |f| f.clamp(0.0, 4.0));
+        }
+    }
+    1.0
+}
+
+/// Reads and dispatches events, waiting at most until `until`.
+fn dispatch(
+    queue: &mut EventQueue<Overlay>,
+    ov: &mut Overlay,
+    until: Option<Instant>,
+) -> Result<(), String> {
+    queue.dispatch_pending(ov).map_err(|e| e.to_string())?;
+    queue.flush().map_err(|e| e.to_string())?;
+    if let Some(guard) = queue.prepare_read() {
+        let left = until.map(|t| t.saturating_duration_since(Instant::now()));
+        let ts = left.and_then(|d| Timespec::try_from(d).ok());
+        let fd = guard.connection_fd();
+        let mut fds = [PollFd::new(&fd, PollFlags::IN)];
+        let polled = poll(&mut fds, ts.as_ref());
+        match polled {
+            Ok(n) if n > 0 => {
+                guard.read().map_err(|e| e.to_string())?;
+            }
+            Ok(_) | Err(rustix::io::Errno::INTR) => drop(guard),
+            Err(e) => return Err(e.to_string()),
+        }
+        queue.dispatch_pending(ov).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 struct Screen {
@@ -163,6 +283,14 @@ struct Screen {
     configured: bool,
     waiting_frame: bool,
     dirty: bool,
+    /// Until then the screen shows a transparent pixel (see `Overlay::hold`):
+    /// `hold` after the compositor's first frame callback for it, or a
+    /// fixed time after the configure if none comes.
+    reveal: Option<Instant>,
+    /// The transparent pixel's first frame callback is still to come.
+    blank_frame_due: bool,
+    /// The transparent pixel, once attached.
+    blank: Option<Buffer>,
 }
 
 fn new_buffer<'p>(pool: &'p mut SlotPool, px: &Pixels) -> Result<(Buffer, &'p mut [u8]), String> {
@@ -189,6 +317,9 @@ struct Overlay {
     pool: SlotPool,
     frame: Rc<Frame>,
     style: Style,
+    /// How long a new screen shows nothing, for the compositor's open
+    /// animation to play out unseen.
+    hold: Duration,
     screens: Vec<Screen>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
@@ -248,6 +379,9 @@ impl Overlay {
                 configured: false,
                 waiting_frame: false,
                 dirty: false,
+                reveal: None,
+                blank_frame_due: false,
+                blank: None,
             });
         }
         if self.screens.is_empty() {
@@ -300,6 +434,52 @@ impl Overlay {
         self.result = Some(Err(e));
     }
 
+    /// When the first screen still on hold is due to show its frame.
+    fn next_reveal(&self) -> Option<Instant> {
+        self.screens.iter().filter_map(|s| s.reveal).min()
+    }
+
+    /// Shows screen `i` as one transparent pixel stretched over it. KWin
+    /// plays its open and close animations (a fade and a zoom) on whatever a
+    /// new window shows; on the frozen frame that reads as a second, smaller
+    /// copy of the screen fading in over the live one. On a transparent
+    /// window nothing of it can be seen.
+    fn show_blank(&mut self, i: usize, qh: Option<&QueueHandle<Self>>) -> Result<(), String> {
+        let Overlay { pool, screens, .. } = self;
+        let s = &mut screens[i];
+        if s.blank.is_some() && s.shown.is_none() {
+            return Ok(());
+        }
+        let (buffer, canvas) = pool
+            .create_buffer(1, 1, 4, wl_shm::Format::Argb8888)
+            .map_err(|e| format!("can't allocate overlay memory: {e}"))?;
+        canvas[..4].fill(0);
+        let surface = s.layer.wl_surface();
+        buffer
+            .attach_to(surface)
+            .map_err(|e| format!("overlay buffer error: {e}"))?;
+        surface.damage_buffer(0, 0, 1, 1);
+        if let Some(qh) = qh {
+            surface.frame(qh, surface.clone());
+            s.blank_frame_due = s.reveal.is_some();
+        }
+        s.layer.commit();
+        s.blank = Some(buffer);
+        s.shown = None;
+        Ok(())
+    }
+
+    /// Blanks every screen that has shown its frame, so that the compositor's
+    /// close animation has nothing to show either.
+    fn blank_all(&mut self) {
+        for i in 0..self.screens.len() {
+            let s = &self.screens[i];
+            if s.configured && s.pixels.is_some() && s.reveal.is_none() {
+                let _ = self.show_blank(i, None);
+            }
+        }
+    }
+
     fn mark_all_dirty(&mut self) {
         for s in &mut self.screens {
             s.dirty = true;
@@ -325,6 +505,13 @@ impl Overlay {
     /// differently, and damages only what changed since the last commit.
     /// Commits nothing when the change doesn't touch this screen.
     fn draw(&mut self, i: usize, qh: &QueueHandle<Self>) -> Result<(), String> {
+        if let Some(t) = self.screens[i].reveal {
+            if Instant::now() < t {
+                return self.show_blank(i, Some(qh));
+            }
+            self.screens[i].reveal = None;
+            self.screens[i].blank_frame_due = false;
+        }
         let want = self.selection().filter(|r| !r.is_empty());
         let Overlay {
             pool,
@@ -337,7 +524,7 @@ impl Overlay {
             return Ok(());
         };
         let damage = match s.shown {
-            Some(prev) => px.changed(frame, prev, want),
+            Some(prev) => px.changed(prev, want),
             None => Rects::one(px.bounds()),
         };
         if damage.is_empty() {
@@ -452,7 +639,15 @@ impl CompositorHandler for Overlay {
         _: u32,
     ) {
         if let Some(i) = self.screen_of(surface) {
-            self.screens[i].waiting_frame = false;
+            let hold = self.hold;
+            let s = &mut self.screens[i];
+            s.waiting_frame = false;
+            if s.blank_frame_due {
+                // The compositor has shown the transparent pixel: its open
+                // animation started about now.
+                s.blank_frame_due = false;
+                s.reveal = Some(Instant::now() + hold);
+            }
         }
     }
 
@@ -513,6 +708,9 @@ impl LayerShellHandler for Overlay {
         if s.pixels.is_none() {
             // The frozen frame, dimmed, once: redraws copy from it.
             s.pixels = Pixels::new(&self.frame, &s.geom, self.style.dim, self.style.accent);
+            if !self.hold.is_zero() {
+                s.reveal = Some(Instant::now() + self.hold + FIRST_FRAME_WAIT);
+            }
             if s.pixels.is_none() {
                 self.fail("a screen lies outside the captured frame".into());
                 return;

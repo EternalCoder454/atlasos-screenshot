@@ -1,4 +1,5 @@
-//! KWin's `org.kde.KWin.ScreenShot2.CaptureWorkspace`.
+//! KWin's `org.kde.KWin.ScreenShot2`: `CaptureWorkspace`, and `CaptureScreen`
+//! for one output in its own pixels.
 //!
 //! We pass the write end of a pipe; KWin replies with the image's metadata
 //! (`type` "raw", `width`, `height`, `stride`, `format` as a `QImage::Format`)
@@ -23,6 +24,15 @@ const IFACE: &str = "org.kde.KWin.ScreenShot2";
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn capture_workspace(include_cursor: bool) -> Result<RgbaImage, CaptureError> {
+    capture(None, include_cursor)
+}
+
+/// One output (by its name) in its own pixels, as KWin put it on screen.
+pub fn capture_screen(name: &str, include_cursor: bool) -> Result<RgbaImage, CaptureError> {
+    capture(Some(name), include_cursor)
+}
+
+fn capture(screen: Option<&str>, include_cursor: bool) -> Result<RgbaImage, CaptureError> {
     let conn = zbus::blocking::connection::Builder::session()
         .and_then(|b| b.method_timeout(TIMEOUT).build())
         .map_err(|e| CaptureError::Unavailable(format!("no D-Bus session bus: {e}")))?;
@@ -34,13 +44,22 @@ pub fn capture_workspace(include_cursor: bool) -> Result<RgbaImage, CaptureError
     options.insert("include-cursor", Value::from(include_cursor));
     options.insert("native-resolution", Value::from(true));
 
-    let reply = conn.call_method(
-        Some(DEST),
-        PATH,
-        Some(IFACE),
-        "CaptureWorkspace",
-        &(options, Fd::from(write_end.as_fd())),
-    );
+    let reply = match screen {
+        None => conn.call_method(
+            Some(DEST),
+            PATH,
+            Some(IFACE),
+            "CaptureWorkspace",
+            &(options, Fd::from(write_end.as_fd())),
+        ),
+        Some(name) => conn.call_method(
+            Some(DEST),
+            PATH,
+            Some(IFACE),
+            "CaptureScreen",
+            &(name, options, Fd::from(write_end.as_fd())),
+        ),
+    };
     // KWin holds its own copy now; ours must close or we never see EOF.
     drop(write_end);
     let reply = reply.map_err(classify)?;
