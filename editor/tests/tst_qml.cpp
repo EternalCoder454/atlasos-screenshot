@@ -1,3 +1,5 @@
+#include "backend.h"
+
 #include <QImage>
 #include <QPainter>
 #include <QQmlContext>
@@ -12,6 +14,9 @@ class Setup : public QObject
 public:
     Setup()
     {
+        // The environment names the fake CLI for the tests; the product itself ignores it.
+        if (qEnvironmentVariableIsSet("TELAMON_SCREENSHOT_BIN"))
+            Backend::setCliPathForTests(qEnvironmentVariable("TELAMON_SCREENSHOT_BIN"));
         QImage img(400, 300, QImage::Format_RGB32);
         QPainter p(&img);
         p.fillRect(img.rect(), QColor(240, 240, 250));

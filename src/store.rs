@@ -56,7 +56,7 @@ fn read_small(path: &Path) -> Option<String> {
 
 /// The value of `XDG_<name>_DIR="..."` in a `user-dirs.dirs` file; `$HOME`
 /// at its start is the home folder. Relative or odd values are ignored.
-fn user_dir_from(text: &str, name: &str, home: &Path) -> Option<PathBuf> {
+pub(crate) fn user_dir_from(text: &str, name: &str, home: &Path) -> Option<PathBuf> {
     let key = format!("XDG_{name}_DIR=");
     let value = text
         .lines()
@@ -112,12 +112,7 @@ pub fn save_png(dir: &Path, png: &[u8]) -> Result<PathBuf, String> {
         ));
     }
     let stamp = local_stamp(std::time::SystemTime::now());
-    let names: Vec<String> = (0..100)
-        .map(|n| match n {
-            0 => format!("Screenshot_{stamp}.png"),
-            n => format!("Screenshot_{stamp}-{n}.png"),
-        })
-        .collect();
+    let names = names(&stamp);
     let saved = match save_unnamed(&dfd, png, &names) {
         Ok(Some(name)) => Ok(Some(name)),
         Ok(None) => save_renamed(&dfd, png, &names),
@@ -134,6 +129,17 @@ pub fn save_png(dir: &Path, png: &[u8]) -> Result<PathBuf, String> {
     }
 }
 
+/// The names tried for a stamp, in order: `Screenshot_<stamp>.png`, then
+/// `Screenshot_<stamp>-1.png` to `-99.png`.
+pub(crate) fn names(stamp: &str) -> Vec<String> {
+    (0..100)
+        .map(|n| match n {
+            0 => format!("Screenshot_{stamp}.png"),
+            n => format!("Screenshot_{stamp}-{n}.png"),
+        })
+        .collect()
+}
+
 fn write_synced(fd: rustix::fd::OwnedFd, png: &[u8]) -> std::io::Result<()> {
     let mut f = std::fs::File::from(fd);
     f.write_all(png)?;
@@ -144,7 +150,7 @@ const SAVE_MODE: rustix::fs::Mode = rustix::fs::Mode::RUSR.union(rustix::fs::Mod
 
 /// `O_TMPFILE` + `linkat`. `Ok(None)` (before anything is visible) when the
 /// file system or a missing /proc rules it out.
-fn save_unnamed(
+pub(crate) fn save_unnamed(
     dfd: &rustix::fd::OwnedFd,
     png: &[u8],
     names: &[String],
@@ -178,7 +184,7 @@ fn save_unnamed(
 }
 
 /// A random temp name, renamed without replacing. `Ok(None)`: no free name.
-fn save_renamed(
+pub(crate) fn save_renamed(
     dfd: &rustix::fd::OwnedFd,
     png: &[u8],
     names: &[String],
@@ -212,12 +218,18 @@ fn save_renamed(
     result
 }
 
+/// The last second `utc_stamp` writes: 9999-12-31 23:59:59. A time past it
+/// (or before 1970) is clamped, so a name is always `YYYYMMDD_HHMMSS`: eight
+/// digits, an underscore, six digits.
+const MAX_STAMP_SECS: i64 = 253_402_300_799;
+
 /// The time on the user's clock (the UTC stamp shifted by the local offset).
-fn local_stamp(t: std::time::SystemTime) -> String {
+pub(crate) fn local_stamp(t: std::time::SystemTime) -> String {
     let secs = t
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(MAX_STAMP_SECS))
+        .unwrap_or(0)
+        .min(MAX_STAMP_SECS);
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     let now = secs as libc::time_t;
     // SAFETY: localtime_r only writes the `tm` we own.
@@ -226,15 +238,19 @@ fn local_stamp(t: std::time::SystemTime) -> String {
     } else {
         tm.tm_gmtoff
     };
-    utc_stamp(std::time::UNIX_EPOCH + std::time::Duration::from_secs((secs + off).max(0) as u64))
+    utc_stamp(
+        std::time::UNIX_EPOCH
+            + std::time::Duration::from_secs(secs.saturating_add(off).max(0) as u64),
+    )
 }
 
 /// `20261005_174012` (UTC), from the civil-from-days algorithm.
-fn utc_stamp(t: std::time::SystemTime) -> String {
+pub(crate) fn utc_stamp(t: std::time::SystemTime) -> String {
     let secs = t
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(MAX_STAMP_SECS))
+        .unwrap_or(0)
+        .clamp(0, MAX_STAMP_SECS);
     let (days, rem) = (secs.div_euclid(86400), secs.rem_euclid(86400));
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
@@ -262,6 +278,51 @@ mod tests {
         let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_791_250_812);
         assert_eq!(utc_stamp(t), "20261006_014012");
         assert_eq!(utc_stamp(std::time::UNIX_EPOCH), "19700101_000000");
+    }
+
+    #[test]
+    fn stamps_stay_in_shape_at_the_ends_of_time() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let shape = |s: &str| {
+            s.len() == 15
+                && s.as_bytes()[8] == b'_'
+                && s.bytes()
+                    .enumerate()
+                    .all(|(i, b)| i == 8 || b.is_ascii_digit())
+        };
+        for secs in [
+            0,
+            1,
+            951_782_400,
+            253_402_300_799,
+            253_402_300_800,
+            i64::MAX as u64,
+        ] {
+            // (the largest times the platform holds; none may panic)
+            let Some(t) = UNIX_EPOCH.checked_add(Duration::from_secs(secs)) else {
+                continue;
+            };
+            assert!(shape(&utc_stamp(t)), "utc {secs}");
+            assert!(shape(&local_stamp(t)), "local {secs}");
+        }
+        assert_eq!(
+            utc_stamp(UNIX_EPOCH + Duration::from_secs(253_402_300_799)),
+            "99991231_235959"
+        );
+        assert_eq!(
+            utc_stamp(UNIX_EPOCH + Duration::from_secs(253_402_300_800)),
+            "99991231_235959"
+        );
+        // Before 1970 is 1970.
+        assert_eq!(
+            utc_stamp(UNIX_EPOCH - Duration::from_secs(5)),
+            "19700101_000000"
+        );
+        // Leap day.
+        assert_eq!(
+            utc_stamp(UNIX_EPOCH + Duration::from_secs(951_782_400)),
+            "20000229_000000"
+        );
     }
 
     #[test]

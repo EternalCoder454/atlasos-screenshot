@@ -34,7 +34,8 @@ fi
 
 tty=()
 [ -t 0 ] && tty=(-it)
-exec podman run --rm --init "${tty[@]}" --security-opt label=disable \
+# core=0: a crash must not leave a core dump (screen contents) in the system store.
+exec podman run --rm --init "${tty[@]}" --security-opt label=disable --ulimit core=0 \
     -v "$repo":/src -w /src \
     -v "$work":/work \
     -v telamon-cargo:/root/.cargo/registry \

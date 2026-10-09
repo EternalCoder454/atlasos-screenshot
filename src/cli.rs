@@ -26,6 +26,10 @@ Options:
   --no-save        copy only; keep nothing on disk (output.save = false does
                    this for every shot)
   --no-notify      no notification after the capture (errors are still shown)
+  --notify         a notification even when output.notify is false (what the
+                   org.kde.Spectacle service uses, so no capture is silent)
+  --requested-by NAME  who asked for this capture (the D-Bus service says
+                   which program); shown in the notification
   --edit           open the editor with the picture
   --cursor, --no-cursor    with or without the pointer
   --no-frame       windows without their title bar and borders
@@ -53,6 +57,10 @@ pub struct Args {
     pub delay: u32,
     pub no_save: bool,
     pub no_notify: bool,
+    /// A notification even when `output.notify` is false.
+    pub notify: bool,
+    /// Who asked, for the notification (the D-Bus service sets it).
+    pub requested_by: Option<String>,
     pub edit: bool,
     pub cursor: Option<bool>,
     pub frame: Option<bool>,
@@ -135,6 +143,13 @@ pub fn parse_args(it: impl Iterator<Item = String>) -> Result<Action, String> {
             }
             "--no-save" => args.no_save = true,
             "--no-notify" => args.no_notify = true,
+            "--notify" => args.notify = true,
+            "--requested-by" => {
+                let v = it.next().ok_or("--requested-by needs a name")?;
+                args.requested_by = Some(
+                    check_label(&v).ok_or_else(|| format!("bad name {v:?} for --requested-by"))?,
+                );
+            }
             "--edit" => args.edit = true,
             "--cursor" => args.cursor = Some(true),
             "--no-cursor" => args.cursor = Some(false),
@@ -145,7 +160,22 @@ pub fn parse_args(it: impl Iterator<Item = String>) -> Result<Action, String> {
             _ => return Err(format!("unknown argument {a:?}")),
         }
     }
+    if args.notify && args.no_notify {
+        return Err("choose one of --notify, --no-notify (not both)".into());
+    }
     Ok(Action::Run(args))
+}
+
+/// The longest name `--requested-by` takes.
+pub const MAX_LABEL: usize = 64;
+
+/// A name for the notification: printable, one line, not empty. Anything
+/// else is refused rather than cleaned, so what is shown is what was given.
+fn check_label(s: &str) -> Option<String> {
+    let ok = !s.trim().is_empty()
+        && s.chars().count() <= MAX_LABEL
+        && !s.chars().any(|c| c.is_control());
+    ok.then(|| s.to_string())
 }
 
 /// A helper mode takes no other argument.
@@ -264,6 +294,23 @@ mod tests {
         assert_eq!(a.cursor, Some(false));
         assert_eq!(a.frame, Some(false));
         assert_eq!(a.shadow, Some(true));
+    }
+
+    #[test]
+    fn notify_and_requester() {
+        let a = run(&["--full", "--notify", "--requested-by", "KDE Connect"]);
+        assert!(a.notify && !a.no_notify);
+        assert_eq!(a.requested_by.as_deref(), Some("KDE Connect"));
+        assert!(parse(&["--notify", "--no-notify"]).is_err());
+        // The value is taken whatever it looks like, and checked.
+        let a = run(&["--requested-by", "--full"]);
+        assert_eq!(a.requested_by.as_deref(), Some("--full"));
+        assert_eq!(a.kind, None);
+        for bad in ["", "   ", "a\nb", "a\u{1b}[31m", &"x".repeat(MAX_LABEL + 1)] {
+            assert!(parse(&["--requested-by", bad]).is_err(), "{bad:?}");
+        }
+        assert!(parse(&["--requested-by"]).is_err());
+        assert!(parse(&["--requested-by", &"x".repeat(MAX_LABEL)]).is_ok());
     }
 
     #[test]

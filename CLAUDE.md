@@ -29,7 +29,14 @@ crate) and `editor/`, the Qt/QML annotation editor (own CMake build).
   HTTPS URLs, pinned SHA-256, 0700 folder, temp file + rename.
 - **`org.kde.Spectacle`** (`src/dbus.rs`) mirrors Spectacle's interface so
   programs that ask it keep working; the action ids in the `.desktop` file are
-  Spectacle's, so users' shortcuts can move by name. Don't rename them.
+  Spectacle's, so users' shortcuts can move by name. Don't rename them. A
+  capture asked for over D-Bus is never silent (`--notify`, `--requested-by`,
+  the countdown, the rate limit) and nothing but the file's path goes back.
+- **Security rules** are in `docs/SECURITY.md`: update it with any new way in,
+  place the picture goes, parser, or restricted-interface grant. The editor
+  never gets a restricted interface. No `PR_SET_DUMPABLE` (KWin needs
+  `/proc/<pid>/exe`); core dumps are off with `RLIMIT_CORE`. Programs started
+  from a button are absolute paths. Dev containers run with `--ulimit core=0`.
 - **Redaction is an opaque fill, never a blur**, and documented as best-effort.
 - The config file is untrusted: bad or unknown values give the defaults plus
   one warning, never a panic.
@@ -53,5 +60,8 @@ crate) and `editor/`, the Qt/QML annotation editor (own CMake build).
 | Release build | `scripts/dev.sh cargo build --release --locked` |
 | Redraw benchmark | `scripts/dev.sh cargo test --release --locked redraw_bench -- --ignored --nocapture` |
 | End-to-end (KWin) | `scripts/e2e-kwin.sh` (in `localhost/telamonos:telamon-test`; three parts: online, offline, modes) |
-| Editor | `scripts/dev-editor.sh` (see `editor/`) |
-| RPM | `podman run --rm --init --security-opt label=disable -v "$PWD":/src:ro -v <out>:/out -v telamon-cargo:/root/.cargo/registry -e CARGO_HOME=/root/.cargo registry.fedoraproject.org/fedora:44 /src/packaging/build-rpm.sh /out` |
+| Editor | `scripts/dev-editor.sh editor/build.sh` (builds and runs its tests) |
+| Dependency audit | `cargo deny --locked check advisories bans licenses sources` (CI: `audit.yml`) |
+| Hardening of a build | `scripts/check-hardening.sh [--rust] <elf>` (the spec's `%check` runs it) |
+| Fuzz | see `fuzz/run.sh` (nightly, cargo-fuzz; CI: `fuzz.yml`) |
+| RPM | `podman run --rm --init --security-opt label=disable --ulimit core=0 -v "$PWD":/src:ro -v <out>:/out -v telamon-cargo:/root/.cargo/registry -e CARGO_HOME=/root/.cargo registry.fedoraproject.org/fedora:44 /src/packaging/build-rpm.sh /out` |

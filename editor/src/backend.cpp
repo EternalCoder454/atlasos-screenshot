@@ -19,7 +19,9 @@
 #include <memory>
 
 #include <cerrno>
+#include <fcntl.h>
 #include <poll.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 using namespace Qt::StringLiterals;
@@ -44,6 +46,40 @@ QString plainLine(const QByteArray &raw, int max = 200)
     return s.left(max);
 }
 
+// A read-only view of the first `max` bytes of another device, so a file that
+// grows while it is read (or a device that has no end) is never read past the cap.
+class BoundedDevice : public QIODevice
+{
+public:
+    BoundedDevice(QIODevice *inner, qint64 max)
+        : m_inner(inner), m_max(max)
+    {
+        open(QIODevice::ReadOnly);
+    }
+    bool isSequential() const override { return m_inner->isSequential(); }
+    qint64 size() const override { return qMin(m_inner->size(), m_max); }
+    bool seek(qint64 pos) override
+    {
+        if (pos < 0 || pos > m_max || !m_inner->seek(pos))
+            return false;
+        return QIODevice::seek(pos);
+    }
+
+protected:
+    qint64 readData(char *data, qint64 len) override
+    {
+        const qint64 left = m_max - m_inner->pos();
+        if (left <= 0)
+            return 0;
+        return m_inner->read(data, qMin(len, left));
+    }
+    qint64 writeData(const char *, qint64) override { return -1; }
+
+private:
+    QIODevice *m_inner;
+    qint64 m_max;
+};
+
 } // namespace
 
 namespace shot {
@@ -51,7 +87,12 @@ namespace shot {
 QImage decodeImage(QIODevice *device, QString *error)
 {
     QImageReader::setAllocationLimit(1280); // MiB: a 16384 x 16384 image is 1 GiB
-    QImageReader reader(device);
+    if (device->size() > Backend::kMaxInputBytes) {
+        *error = QObject::tr("The file is too large.");
+        return {};
+    }
+    BoundedDevice bounded(device, Backend::kMaxInputBytes);
+    QImageReader reader(&bounded);
     reader.setAutoTransform(true);
     if (!reader.canRead() || !allowedFormat(reader.format())) {
         *error = QObject::tr("This is not an image the editor can open.");
@@ -82,22 +123,35 @@ QImage decodeImage(QIODevice *device, QString *error)
 
 QImage decodeFile(const QString &path, QString *error)
 {
-    const QFileInfo info(path);
-    if (!info.exists()) {
-        *error = QObject::tr("The file does not exist.");
+    // Opened once, and every check is made on the open descriptor, so nothing
+    // can be swapped in between. O_NONBLOCK: opening a FIFO neither waits for
+    // a writer nor blocks later (it is refused below, as is any device).
+    // Symlinks are followed: people open linked files.
+    const int fd = ::open(QFile::encodeName(path).constData(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) {
+        *error = errno == ENOENT || errno == ENOTDIR ? QObject::tr("The file does not exist.")
+                                                       : QObject::tr("The file could not be opened.");
         return {};
     }
-    // A regular file only: a pipe or a device could block or never end.
-    if (!info.isFile()) {
+    struct stat st;
+    if (::fstat(fd, &st) != 0) {
+        ::close(fd);
+        *error = QObject::tr("The file could not be opened.");
+        return {};
+    }
+    if (!S_ISREG(st.st_mode)) {
+        ::close(fd);
         *error = QObject::tr("This is not a file.");
         return {};
     }
-    if (info.size() > Backend::kMaxInputBytes) {
+    if (st.st_size > Backend::kMaxInputBytes) {
+        ::close(fd);
         *error = QObject::tr("The file is too large.");
         return {};
     }
-    QFile file(path);
-    if (!file.open(QIODevice::ReadOnly)) {
+    QFile file;
+    if (!file.open(fd, QIODevice::ReadOnly, QFile::AutoCloseHandle)) {
+        ::close(fd);
         *error = QObject::tr("The file could not be opened.");
         return {};
     }
@@ -119,10 +173,23 @@ Backend::~Backend()
     }
 }
 
+namespace {
+QString &cliOverride()
+{
+    static QString path;
+    return path;
+}
+} // namespace
+
 QString Backend::cliPath()
 {
-    const QString env = qEnvironmentVariable("TELAMON_SCREENSHOT_BIN");
-    return env.isEmpty() ? u"/usr/bin/telamon-screenshot"_s : env;
+    const QString &over = cliOverride();
+    return over.isEmpty() ? u"/usr/bin/telamon-screenshot"_s : over;
+}
+
+void Backend::setCliPathForTests(const QString &path)
+{
+    cliOverride() = path;
 }
 
 QString Backend::baseName(const QString &path) const
@@ -386,10 +453,17 @@ QString Backend::saveAs(const QString &path, const QVariantList &items, const QR
     const QByteArray format = suffix == u"png"_s ? "png" : "jpeg";
     // Written to a temporary file next to the target and renamed over it: a
     // crash or a full disk never leaves half a file under the real name.
+    const bool existed = QFileInfo::exists(target);
     QSaveFile file(target);
     file.setDirectWriteFallback(false);
     if (!file.open(QIODevice::WriteOnly))
         return tr("The file could not be written: %1").arg(file.errorString());
+    // A new file is private, like the files of the CLI (the umask would make
+    // it readable by others); a file that is replaced keeps its mode.
+    if (!existed && !file.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner)) {
+        file.cancelWriting();
+        return tr("The file could not be written: %1").arg(file.errorString());
+    }
     QImageWriter writer(&file, format);
     if (format == "jpeg")
         writer.setQuality(92);

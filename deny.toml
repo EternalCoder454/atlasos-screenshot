@@ -1,0 +1,53 @@
+# cargo deny check (CI: .github/workflows/audit.yml): advisories, bans,
+# licenses and sources, all four. Each ignore and each exception needs a
+# reason and, for an ignore, a date to look at it again.
+[graph]
+# What ships is Linux on x86_64 (the Fedora-based Telamon OS image). Crates
+# only other targets pull in (windows-sys, wasi, ...) are left out.
+targets = ["x86_64-unknown-linux-gnu"]
+
+[advisories]
+# Unmaintained crates count only for this package's direct dependencies;
+# yanked versions in the lock always fail.
+unmaintained = "workspace"
+yanked = "deny"
+ignore = []
+
+[bans]
+# More than one version of a crate is allowed (zbus and the Wayland crates
+# bring their own), but it is shown.
+multiple-versions = "warn"
+wildcards = "deny"
+# TLS is rustls only (ureq's `rustls` feature, with ring), and only for the
+# model download. No OpenSSL, in any form: its parsing of untrusted
+# certificates is C, and the image does not need a second TLS stack.
+deny = [
+    { crate = "openssl" },
+    { crate = "openssl-sys" },
+    { crate = "openssl-probe" },
+    { crate = "native-tls" },
+    { crate = "aws-lc-rs" },
+    { crate = "aws-lc-sys" },
+]
+
+# The licences of what is in Cargo.lock. Nothing without a licence passes.
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    # webpki-roots: the Mozilla root list as data.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+# Only crates.io. No git dependencies.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

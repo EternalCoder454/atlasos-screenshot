@@ -74,7 +74,7 @@ pub fn finish(done: Done) {
 
 /// The job as the helper reads it: `name:length\n` and that many bytes, for
 /// each field that is set.
-fn encode(d: &Done) -> Vec<u8> {
+pub(crate) fn encode(d: &Done) -> Vec<u8> {
     let mut out = Vec::new();
     let mut put = |name: &str, bytes: &[u8]| {
         out.extend_from_slice(format!("{name}:{}\n", bytes.len()).as_bytes());
@@ -109,7 +109,7 @@ fn encode(d: &Done) -> Vec<u8> {
 /// is far below it).
 const MAX_JOB: u64 = 320 * 1024 * 1024;
 
-fn decode(input: impl Read) -> Result<Done, String> {
+pub(crate) fn decode(input: impl Read) -> Result<Done, String> {
     let mut data = Vec::new();
     input
         .take(MAX_JOB + 1)
@@ -133,8 +133,10 @@ fn decode(input: impl Read) -> Result<Done, String> {
         let head = std::str::from_utf8(&rest[..nl]).map_err(|_| "a bad job")?;
         let (name, len) = head.split_once(':').ok_or("a bad job")?;
         let len: usize = len.parse().map_err(|_| "a bad job")?;
-        let body = rest.get(nl + 1..nl + 1 + len).ok_or("a cut job")?;
-        rest = &rest[nl + 1 + len..];
+        // checked: a length near usize::MAX must be "cut", not a wrapped sum.
+        let end = (nl + 1).checked_add(len).ok_or("a cut job")?;
+        let body = rest.get(nl + 1..end).ok_or("a cut job")?;
+        rest = &rest[end..];
         let text = || String::from_utf8_lossy(body).into_owned();
         match name {
             "title" => done.title = text(),
@@ -283,6 +285,16 @@ mod tests {
         assert!(decode(&b"title\n"[..]).is_err(), "no length");
         assert!(decode(&b"title:x\n"[..]).is_err(), "bad length");
         assert!(decode(&b"title:99999999999999999999\n"[..]).is_err());
+        // Lengths that would wrap the offset around.
+        for len in [
+            usize::MAX,
+            usize::MAX - 1,
+            usize::MAX - 5,
+            usize::MAX / 2 + 1,
+        ] {
+            let job = format!("title:{len}\nx");
+            assert!(decode(job.as_bytes()).is_err(), "{len}");
+        }
         // A relative path is dropped; a thumbnail of the wrong size too.
         let d = decode(&b"path:3\nabcthumb:9\n12345678x"[..]).unwrap();
         assert!(d.path.is_none() && d.image.is_none());

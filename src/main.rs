@@ -23,6 +23,7 @@ mod clipboard;
 mod config;
 mod countdown;
 mod dbus;
+mod harden;
 mod legacy;
 #[cfg(feature = "ocr")]
 mod models;
@@ -30,13 +31,13 @@ mod modes;
 mod notify;
 mod ocr;
 mod overlay;
+mod pngin;
 mod post;
 mod redact;
 mod store;
 mod watchdog;
 
 use std::fs::OpenOptions;
-use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -49,6 +50,8 @@ use config::Config;
 use modes::{Kind, Mode};
 
 fn main() -> ExitCode {
+    // The process holds screen contents: a crash must not write them out.
+    harden::no_core_dumps();
     let action = match cli::parse_args(std::env::args().skip(1)) {
         Ok(a) => a,
         Err(e) => {
@@ -124,43 +127,18 @@ fn helper(cfg: &Config) -> Result<bool, String> {
     match action {
         Action::Dbus => dbus::serve().map(|()| true),
         Action::SavePng => {
-            let png = read_png(std::io::stdin().lock())?;
+            let png = pngin::read_png(std::io::stdin().lock())?;
             let path = save_capture(&png, cfg)?;
             println!("{}", path.display());
             Ok(true)
         }
         Action::CopyPng => {
-            let png = read_png(std::io::stdin().lock())?;
+            let png = pngin::read_png(std::io::stdin().lock())?;
             clipboard::copy(Payload::Png(png))?;
             Ok(true)
         }
         _ => Ok(false),
     }
-}
-
-/// The biggest PNG taken from stdin.
-const MAX_STDIN_PNG: u64 = 256 * 1024 * 1024;
-
-/// A PNG from `input`, checked: the signature, and a size that is a screen's
-/// and not a bomb's. The bytes are kept as they are.
-fn read_png(input: impl Read) -> Result<Vec<u8>, String> {
-    use image::ImageDecoder;
-
-    let mut png = Vec::new();
-    input
-        .take(MAX_STDIN_PNG + 1)
-        .read_to_end(&mut png)
-        .map_err(|e| format!("can't read the picture: {e}"))?;
-    if png.len() as u64 > MAX_STDIN_PNG {
-        return Err("the picture is too large".into());
-    }
-    let dec = image::codecs::png::PngDecoder::new(std::io::Cursor::new(&png))
-        .map_err(|_| "that is not a PNG picture".to_string())?;
-    let (w, h) = dec.dimensions();
-    if w == 0 || h == 0 || w > 16384 || h > 16384 {
-        return Err(format!("a {w}x{h} picture is too large"));
-    }
-    Ok(png)
 }
 
 /// `Ok(false)` when the user cancelled.
@@ -229,7 +207,8 @@ fn run(args: &Args, cfg: &Config) -> Result<bool, String> {
         },
         _ => (None, None),
     };
-    let notify = (cfg.output.notify && !args.no_notify) || save_error.is_some();
+    // `--notify` is the D-Bus service's: its captures are never silent.
+    let notify = (cfg.output.notify && !args.no_notify) || args.notify || save_error.is_some();
     let wants_post = edit || notify;
     let keep_png = match &payload {
         Payload::Png(png) if wants_post => Some(png.clone()),
@@ -237,7 +216,12 @@ fn run(args: &Args, cfg: &Config) -> Result<bool, String> {
     };
     let thumb =
         (notify && !edit && keep_png.is_some() && saved.is_none()).then(|| notify::thumb(&crop));
-    let words = words_for(&payload, saved.as_deref(), save_error.as_deref());
+    let words = words_for(
+        &payload,
+        saved.as_deref(),
+        save_error.as_deref(),
+        args.requested_by.as_deref(),
+    );
     drop(crop);
 
     clipboard::copy(payload)?;
@@ -257,12 +241,22 @@ fn run(args: &Args, cfg: &Config) -> Result<bool, String> {
     Ok(true)
 }
 
-/// The notification's title and body.
+/// The notification's title and body; `requested_by` (a program that asked
+/// over D-Bus) is named in the body.
 fn words_for(
     payload: &Payload,
     saved: Option<&Path>,
     save_error: Option<&str>,
+    requested_by: Option<&str>,
 ) -> (String, String) {
+    let (title, mut body) = words(payload, saved, save_error);
+    if let Some(who) = requested_by {
+        body.push_str(&format!("\nRequested by {who} over D-Bus."));
+    }
+    (title, body)
+}
+
+fn words(payload: &Payload, saved: Option<&Path>, save_error: Option<&str>) -> (String, String) {
     match (payload, saved, save_error) {
         (Payload::Text(t), _, _) => (
             "Text Copied".into(),
@@ -448,6 +442,11 @@ fn encode_png(img: &image::RgbaImage) -> Result<Vec<u8>, String> {
 }
 
 #[cfg(test)]
+mod checks;
+#[cfg(test)]
+mod proptests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -508,26 +507,33 @@ mod tests {
     fn stdin_pictures_are_checked() {
         let img = image::RgbaImage::from_pixel(3, 2, image::Rgba([1, 2, 3, 255]));
         let png = encode_png(&img).unwrap();
-        assert_eq!(read_png(&png[..]).unwrap(), png);
-        assert!(read_png(&b"GIF89a"[..]).is_err());
-        assert!(read_png(&b""[..]).is_err());
+        assert_eq!(pngin::read_png(&png[..]).unwrap(), png);
+        assert!(pngin::read_png(&b"GIF89a"[..]).is_err());
+        assert!(pngin::read_png(&b""[..]).is_err());
         // Too wide for a screen: refused.
         let wide = encode_png(&image::RgbaImage::new(16385, 1)).unwrap();
-        assert!(read_png(&wide[..]).unwrap_err().contains("too large"));
+        assert!(
+            pngin::read_png(&wide[..])
+                .unwrap_err()
+                .contains("too large")
+        );
     }
 
     #[test]
     fn notification_words() {
         let png = Payload::Png(vec![]);
-        let (t, b) = words_for(&png, Some(Path::new("/p/Screenshot_1.png")), None);
+        let (t, b) = words_for(&png, Some(Path::new("/p/Screenshot_1.png")), None, None);
         assert_eq!(t, "Screenshot Saved");
         assert!(b.starts_with("Screenshot_1.png"));
-        let (t, b) = words_for(&png, None, Some("no room"));
+        let (t, b) = words_for(&png, None, Some("no room"), None);
         assert_eq!(t, "Screenshot Copied");
         assert!(b.contains("no room"));
-        assert_eq!(words_for(&png, None, None).0, "Screenshot Copied");
-        let (t, b) = words_for(&Payload::Text("héllo".into()), None, None);
+        assert_eq!(words_for(&png, None, None, None).0, "Screenshot Copied");
+        let (t, b) = words_for(&Payload::Text("héllo".into()), None, None, None);
         assert_eq!(t, "Text Copied");
         assert!(b.starts_with("5 characters"));
+        // A capture a program asked for over D-Bus names the program.
+        let (_, b) = words_for(&png, None, None, Some("curl"));
+        assert!(b.ends_with("Requested by curl over D-Bus."));
     }
 }

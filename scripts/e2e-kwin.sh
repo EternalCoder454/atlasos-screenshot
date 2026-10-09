@@ -31,7 +31,7 @@ gpu=()
 [ -e /dev/dri/renderD128 ] && gpu=(--device /dev/dri/renderD128)
 
 run() {
-    podman run --rm --init --security-opt label=disable "${gpu[@]}" "${editor_mount[@]}" "$@" \
+    podman run --rm --init --security-opt label=disable --ulimit core=0 "${gpu[@]}" "${editor_mount[@]}" "$@" \
         -v "$bin":/in/telamon-screenshot:ro \
         -v "$repo/data":/in/data:ro \
         -v "$repo/scripts/e2e-inner.sh":/in/e2e-inner.sh:ro \

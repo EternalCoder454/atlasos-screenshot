@@ -1,5 +1,6 @@
 // Export, decoding limits, atomic save and the CLI helpers (against the fake CLI).
 #include "backend.h"
+#include "harden.h"
 #include "render.h"
 
 #include <QBuffer>
@@ -9,9 +10,16 @@
 #include <QImage>
 #include <QImageWriter>
 #include <QRandomGenerator>
+#include <QRegularExpression>
 #include <QSignalSpy>
 #include <QTemporaryDir>
 #include <QTest>
+
+#include <fcntl.h>
+#include <future>
+#include <sys/resource.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 using namespace Qt::StringLiterals;
 
@@ -57,6 +65,41 @@ QByteArray pngBytes(const QImage &img)
     return b;
 }
 
+// A PNG of a few dozen bytes (valid signature, IHDR, an empty IDAT, IEND)
+// whose header claims w x h pixels: a pixel bomb.
+QByteArray pngClaiming(quint32 w, quint32 h)
+{
+    auto be32 = [](quint32 v) {
+        QByteArray b(4, 0);
+        for (int i = 0; i < 4; ++i)
+            b[i] = char(v >> (24 - 8 * i));
+        return b;
+    };
+    auto crc32 = [](const QByteArray &data) {
+        quint32 c = 0xffffffffu;
+        for (uchar byte : data) {
+            c ^= byte;
+            for (int k = 0; k < 8; ++k)
+                c = (c & 1) ? (c >> 1) ^ 0xedb88320u : c >> 1;
+        }
+        return ~c;
+    };
+    auto chunk = [&](const char *type, const QByteArray &data) {
+        const QByteArray td = QByteArray(type, 4) + data;
+        return be32(data.size()) + td + be32(crc32(td));
+    };
+    QByteArray ihdr = be32(w) + be32(h);
+    ihdr.append(char(8)).append(char(2)).append(char(0)).append(char(0)).append(char(0)); // 8 bit RGB
+    const QByteArray emptyZlib = QByteArray::fromHex("789c030000000001");
+    return QByteArray("\x89PNG\r\n\x1a\n", 8) + chunk("IHDR", ihdr) + chunk("IDAT", emptyZlib) + chunk("IEND", {});
+}
+
+bool writeFile(const QString &path, const QByteArray &bytes)
+{
+    QFile f(path);
+    return f.open(QIODevice::WriteOnly) && f.write(bytes) == bytes.size();
+}
+
 bool waitFor(const std::function<bool()> &cond, int ms = 5000)
 {
     QElapsedTimer t;
@@ -76,8 +119,36 @@ private:
     QByteArray m_cli;
 
 private slots:
+    // The environment names the fake CLI for the tests; the product ignores
+    // it and only a test passes it on, through the seam.
     void initTestCase() { m_cli = qgetenv("TELAMON_SCREENSHOT_BIN"); }
-    void init() { qputenv("TELAMON_SCREENSHOT_BIN", m_cli); }
+    void init() { Backend::setCliPathForTests(QString::fromLocal8Bit(m_cli)); }
+    void cleanup() { Backend::setCliPathForTests({}); }
+
+    void theEnvironmentDoesNotChooseTheCli()
+    {
+        // A Backend that did not call the seam runs the installed CLI, whatever the environment says.
+        Backend::setCliPathForTests({});
+        const QByteArray old = qgetenv("TELAMON_SCREENSHOT_BIN");
+        qputenv("TELAMON_SCREENSHOT_BIN", "/tmp/evil-telamon-screenshot");
+        Backend be;
+        QCOMPARE(Backend::cliPath(), u"/usr/bin/telamon-screenshot"_s);
+        // And the seam still works for a test.
+        Backend::setCliPathForTests(u"/some/fake"_s);
+        QCOMPARE(Backend::cliPath(), u"/some/fake"_s);
+        Backend::setCliPathForTests({});
+        QCOMPARE(Backend::cliPath(), u"/usr/bin/telamon-screenshot"_s);
+        qputenv("TELAMON_SCREENSHOT_BIN", old);
+    }
+
+    void coreDumpsAreOff()
+    {
+        QVERIFY(shot::hardenProcess());
+        rlimit lim{1, 1};
+        QCOMPARE(::getrlimit(RLIMIT_CORE, &lim), 0);
+        QCOMPARE(quint64(lim.rlim_cur), quint64(0));
+        QCOMPARE(quint64(lim.rlim_max), quint64(0));
+    }
 
     void exportWithoutAnnotationsIsTheInput_data()
     {
@@ -269,6 +340,197 @@ private slots:
         QVERIFY(shot::decodeFile(u"/tmp"_s, &err).isNull());
     }
 
+    // The cap wrapper must not change what the image plugins read: every
+    // format the editor opens decodes from a file and from a buffer, with the
+    // right size (and, for the lossless ones, the right pixels).
+    void everyAllowedFormatDecodesThroughTheCap_data()
+    {
+        QTest::addColumn<QString>("format");
+        QTest::addColumn<bool>("lossless");
+        QTest::newRow("png") << u"png"_s << true;
+        QTest::newRow("bmp") << u"bmp"_s << true;
+        QTest::newRow("jpeg") << u"jpg"_s << false;
+        QTest::newRow("gif") << u"gif"_s << false;
+        QTest::newRow("webp") << u"webp"_s << false;
+    }
+
+    void everyAllowedFormatDecodesThroughTheCap()
+    {
+        QFETCH(QString, format);
+        QFETCH(bool, lossless);
+        if (!QImageWriter::supportedImageFormats().contains(format.toLatin1()))
+            QSKIP("this Qt build has no writer for the format");
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QImage in(211, 137, QImage::Format_RGB32);
+        for (int y = 0; y < in.height(); ++y)
+            for (int x = 0; x < in.width(); ++x)
+                in.setPixel(x, y, qRgb((x * 5) % 256, (y * 7) % 256, (x + y) % 256));
+        const QString path = dir.filePath(u"in."_s + format);
+        QVERIFY(in.save(path));
+
+        QString err;
+        const QImage fromFile = shot::decodeFile(path, &err);
+        QVERIFY2(!fromFile.isNull(), qPrintable(err));
+        QCOMPARE(fromFile.size(), in.size());
+        QFile f(path);
+        QVERIFY(f.open(QIODevice::ReadOnly));
+        QByteArray bytes = f.readAll();
+        QBuffer buf(&bytes);
+        buf.open(QIODevice::ReadOnly);
+        const QImage fromBuffer = shot::decodeImage(&buf, &err);
+        QVERIFY2(!fromBuffer.isNull(), qPrintable(err));
+        QCOMPARE(fromBuffer.size(), in.size());
+        if (lossless) {
+            QVERIFY(samePixels(fromFile.convertedTo(QImage::Format_RGB32), in));
+            QVERIFY(samePixels(fromBuffer.convertedTo(QImage::Format_RGB32), in));
+        }
+    }
+
+    void pixelBombsAreRefusedOnTheirSize_data()
+    {
+        QTest::addColumn<quint32>("w");
+        QTest::addColumn<quint32>("h");
+        QTest::newRow("20000x20000") << quint32(20000) << quint32(20000);
+        QTest::newRow("40000x40000") << quint32(40000) << quint32(40000);
+        QTest::newRow("tall") << quint32(1) << quint32(50000);
+    }
+    void pixelBombsAreRefusedOnTheirSize()
+    {
+        QFETCH(quint32, w);
+        QFETCH(quint32, h);
+        QByteArray bomb = pngClaiming(w, h);
+        QVERIFY(bomb.size() < 100);
+        QBuffer buf(&bomb);
+        buf.open(QIODevice::ReadOnly);
+        QString err;
+        QVERIFY(shot::decodeImage(&buf, &err).isNull());
+        QVERIFY2(err.startsWith(u"The image is too large"_s), qPrintable(err));
+
+        // The same from a file, which is how it arrives.
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString path = dir.filePath(u"bomb.png"_s);
+        QVERIFY(writeFile(path, bomb));
+        err.clear();
+        QVERIFY(shot::decodeFile(path, &err).isNull());
+        QVERIFY2(err.startsWith(u"The image is too large"_s), qPrintable(err));
+    }
+
+    void notAnImageGetsTheGenericMessage()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QByteArray noise(4096, 0);
+        quint32 x = 12345;
+        for (char &c : noise) {
+            x = x * 1664525u + 1013904223u;
+            c = char(x >> 24);
+        }
+        noise[0] = char(0x01);
+        const QList<QPair<QString, QByteArray>> files = {
+            {u"svg.png"_s, "<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10'><rect width='10' height='10'/></svg>"},
+            {u"xmlsvg.png"_s, "<?xml version='1.0'?>\n<svg xmlns='http://www.w3.org/2000/svg' width='10' height='10'/>"},
+            {u"pdf.png"_s, "%PDF-1.7\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n"},
+            {u"random.png"_s, noise},
+            {u"empty.png"_s, QByteArray()},
+        };
+        for (const auto &[name, bytes] : files) {
+            const QString path = dir.filePath(name);
+            QVERIFY(writeFile(path, bytes));
+            QString err;
+            QVERIFY2(shot::decodeFile(path, &err).isNull(), qPrintable(name));
+            if (bytes.isEmpty())
+                QVERIFY2(!err.isEmpty(), qPrintable(name));
+            else
+                QVERIFY2(err == u"This is not an image the editor can open."_s, qPrintable(name + u": "_s + err));
+        }
+    }
+
+    void decodeFileOpensOnlyRegularFiles()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QString err;
+
+        // A symlink to a regular PNG opens (people open linked files).
+        const QString real = dir.filePath(u"real.png"_s);
+        QVERIFY(randomImage(24, 16, QImage::Format_RGB32).save(real));
+        const QString link = dir.filePath(u"link.png"_s);
+        QVERIFY(QFile::link(real, link));
+        QCOMPARE(shot::decodeFile(link, &err).size(), QSize(24, 16));
+        QVERIFY(err.isEmpty());
+
+        // A dangling link, a folder, a device.
+        const QString dangling = dir.filePath(u"dangling.png"_s);
+        QVERIFY(QFile::link(dir.filePath(u"nowhere.png"_s), dangling));
+        QVERIFY(shot::decodeFile(dangling, &err).isNull());
+        QVERIFY(!err.isEmpty());
+        err.clear();
+        QVERIFY(shot::decodeFile(dir.path(), &err).isNull());
+        QCOMPARE(err, u"This is not a file."_s);
+        err.clear();
+        QVERIFY(shot::decodeFile(u"/dev/zero"_s, &err).isNull());
+        QCOMPARE(err, u"This is not a file."_s);
+
+        // Larger than the cap: a sparse file, so nothing is written, and it is refused without reading.
+        const QString big = dir.filePath(u"big.png"_s);
+        {
+            QFile f(big);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            QVERIFY(f.write(pngBytes(randomImage(8, 8, QImage::Format_RGB32))) > 0);
+            QVERIFY(f.resize(Backend::kMaxInputBytes + 1));
+        }
+        err.clear();
+        QVERIFY(shot::decodeFile(big, &err).isNull());
+        QCOMPARE(err, u"The file is too large."_s);
+    }
+
+    void decodeFileDoesNotBlockOnAFifo()
+    {
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const QString fifo = dir.filePath(u"pipe.png"_s);
+        QVERIFY(::mkfifo(QFile::encodeName(fifo).constData(), 0600) == 0);
+
+        // Through a link too: the check is on what is opened, not on the name.
+        const QString link = dir.filePath(u"pipelink.png"_s);
+        QVERIFY(QFile::link(fifo, link));
+
+        for (const QString &path : {fifo, link}) {
+            auto fut = std::async(std::launch::async, [path] {
+                QString err;
+                const bool null = shot::decodeFile(path, &err).isNull();
+                return std::pair(null, err);
+            });
+            if (fut.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+                // Free the reader that waits for a writer, so the test can end.
+                const int fd = ::open(QFile::encodeName(path).constData(), O_WRONLY);
+                if (fd >= 0)
+                    ::close(fd);
+                fut.wait();
+                QFAIL("decodeFile hung on a FIFO");
+            }
+            const auto [null, err] = fut.get();
+            QVERIFY(null);
+            QCOMPARE(err, u"This is not a file."_s);
+        }
+    }
+
+    void decodeImageStopsAtTheCap()
+    {
+        // A device that claims to be huge is refused up front.
+        struct Endless : QIODevice {
+            qint64 size() const override { return Backend::kMaxInputBytes + 1; }
+            qint64 readData(char *d, qint64 n) override { memset(d, 0, n); return n; }
+            qint64 writeData(const char *, qint64) override { return -1; }
+        } endless;
+        endless.open(QIODevice::ReadOnly);
+        QString err;
+        QVERIFY(shot::decodeImage(&endless, &err).isNull());
+        QCOMPARE(err, u"The file is too large."_s);
+    }
+
     void saveAsWritesAtomically()
     {
         QTemporaryDir dir;
@@ -308,6 +570,62 @@ private slots:
         QVERIFY(!be.resolveSavePath(dir.path()).value(u"error"_s).toString().isEmpty());
         QVERIFY(!be.resolveSavePath(dir.filePath(u"no/such/dir/x.png"_s)).value(u"error"_s).toString().isEmpty());
         QVERIFY(!be.saveAs(dir.filePath(u"no/such/dir/x.png"_s), {}, QRectF()).isEmpty());
+    }
+
+    void saveAsMakesNewFilesPrivate()
+    {
+        // Like the CLI's own files (0600), whatever the umask; a file that is
+        // replaced keeps the mode it had.
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const mode_t oldMask = ::umask(022);
+        Backend be;
+        const QString src = dir.filePath(u"in.png"_s);
+        QVERIFY(randomImage(16, 16, QImage::Format_RGB32).save(src));
+        QSignalSpy loaded(&be, &Backend::loaded);
+        be.load(src);
+        QVERIFY(waitFor([&] { return loaded.count() == 1; }));
+
+        auto mode = [](const QString &path) {
+            struct stat st;
+            return ::stat(QFile::encodeName(path).constData(), &st) == 0 ? int(st.st_mode & 0777) : -1;
+        };
+        const QString fresh = dir.filePath(u"fresh.png"_s);
+        QCOMPARE(be.saveAs(fresh, {}, QRectF()), QString());
+        QCOMPARE(mode(fresh), 0600);
+
+        const QString jpg = dir.filePath(u"fresh.jpg"_s);
+        QCOMPARE(be.saveAs(jpg, {}, QRectF()), QString());
+        QCOMPARE(mode(jpg), 0600);
+
+        const QString old = dir.filePath(u"old.png"_s);
+        QVERIFY(writeFile(old, "x"));
+        QVERIFY(QFile::setPermissions(old, QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ReadGroup));
+        QCOMPARE(be.saveAs(old, {}, QRectF()), QString());
+        QCOMPARE(mode(old), 0640);
+        ::umask(oldMask);
+    }
+
+    void qmlShowsOutsideTextAsPlainText()
+    {
+        // File names and CLI error text reach the QML. No Text/Label there
+        // may format them as rich text: only the Telamon.Ui labels, which are
+        // plain, and a rich-text format is never asked for.
+        QDir qml(QStringLiteral(QML_SOURCE_DIR));
+        const QStringList files = qml.entryList({u"*.qml"_s}, QDir::Files);
+        QVERIFY(!files.isEmpty());
+        for (const QString &name : files) {
+            QFile f(qml.filePath(name));
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            const QString text = QString::fromUtf8(f.readAll());
+            for (const QString &bad : {u"Text.RichText"_s, u"Text.AutoText"_s, u"Text.StyledText"_s,
+                                       u"TextEdit.RichText"_s, u"TextEdit.AutoText"_s, u"TextArea"_s}) {
+                QVERIFY2(!text.contains(bad), qPrintable(name + u" uses "_s + bad));
+            }
+            // A bare QtQuick Text or a Controls Label has an automatic format.
+            const QRegularExpression bare(u"(^|[^A-Za-z0-9_.])(Text|Label|QQC2\\.Label|Controls\\.Label)\\s*\\{"_s);
+            QVERIFY2(!bare.match(text).hasMatch(), qPrintable(name + u" has a bare Text or Label"_s));
+        }
     }
 
     void helpersTalkToTheCli()
@@ -358,7 +676,7 @@ private slots:
         qunsetenv("FAKE_CLI_FAIL");
 
         // A CLI that is not there.
-        qputenv("TELAMON_SCREENSHOT_BIN", "/nonexistent/telamon-screenshot");
+        Backend::setCliPathForTests(u"/nonexistent/telamon-screenshot"_s);
         done.clear();
         be.save({}, QRectF());
         QVERIFY(waitFor([&] { return done.count() == 1; }));

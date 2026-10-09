@@ -1,0 +1,38 @@
+# ~/.config/telamon-screenshot/config.toml
+# Every key is optional; these are the defaults. Unknown keys or bad values
+# make the tool use the defaults and print one warning.
+
+[capture]
+# Draw the pointer into the screenshot.
+include_cursor = false
+# What a bare `telamon-screenshot` (the Print key) takes:
+# "region", "full", "screen", "active-window" or "window".
+default_mode = "region"
+# Windows with their title bar and borders, and with their shadow.
+window_frame = true
+window_shadow = true
+
+[overlay]
+# How dark the screen gets around the selection, 0.0 to 0.9.
+dim = 0.45
+# Selection border colour (Telamon.Ui's accent).
+accent = "#8A7AF4"
+
+[redact]
+# What Alt+drag covers.
+emails = true
+ipv4 = true
+ipv6 = true
+mac = true
+# Colour of the boxes, and extra pixels around each.
+fill = "#000000"
+padding = 2
+
+[output]
+# Save every picture (not the text of an OCR copy) as a PNG, and copy it.
+# false: copy only; nothing is written to disk.
+save = true
+# Where. Absolute path. Unset: the Screenshots folder in your Pictures folder.
+# save_dir = "/home/you/Pictures/Screenshots"
+# The notification with Open, Show in Folder, Edit and Copy after each capture.
+notify = true

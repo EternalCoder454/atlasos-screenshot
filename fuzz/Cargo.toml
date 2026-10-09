@@ -1,0 +1,123 @@
+[package]
+name = "telamon-screenshot-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "cargo-fuzz targets for the parsers of Telamon Screenshot's CLI (not part of the build; needs nightly)"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Its own workspace and lock file: the fuzzer builds with sanitizers on
+# nightly and must not change the application's Cargo.lock.
+[workspace]
+
+[features]
+# As in the application: the OCR code is part of what is built (and checked).
+default = ["ocr"]
+ocr = ["dep:ocrs", "dep:rten", "dep:ureq", "dep:ring"]
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+# The application's own dependencies, at the same versions (src/*.rs are
+# compiled into this crate by fuzz/src/lib.rs).
+# Wayland: capture backends and the selection overlay
+wayland-client = "0.31.15"
+wayland-protocols = { version = "0.32.13", features = ["client", "staging"] }
+wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
+smithay-client-toolkit = { version = "0.20", default-features = false, features = ["xkbcommon"] }
+# KWin's ScreenShot2 over D-Bus
+zbus = { version = "5.19", default-features = false, features = ["blocking-api", "async-io"] }
+rustix = { version = "1.1", features = ["fs", "pipe", "event", "process"] }
+# fork/setsid for the clipboard server that outlives the CLI
+libc = "0.2"
+memmap2 = "0.9.11"
+# Clipboard (ext-data-control on KWin, wlr-data-control on wlroots)
+wl-clipboard-rs = "0.9.4"
+# Image buffers and PNG encoding only
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+# OCR, pure Rust. The models are downloaded on first use (src/models.rs).
+ocrs = { version = "0.13.1", optional = true, default-features = false, features = ["rten"] }
+# First-use model download: HTTPS only, rustls + bundled roots; ring is
+# already in the tree through rustls and gives us SHA-256.
+ureq = { version = "3.4.2", optional = true, default-features = false, features = ["rustls"] }
+ring = { version = "0.17.14", optional = true }
+rten = { version = "0.26.0", optional = true, default-features = false, features = ["rten_format"] }
+regex = "1.13"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = { version = "1.1", default-features = false, features = ["parse", "serde"] }
+
+[profile.release]
+debug = 1
+overflow-checks = true
+panic = "unwind"
+
+[[bin]]
+name = "post_decode"
+path = "fuzz_targets/post_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cli_args"
+path = "fuzz_targets/cli_args.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "region"
+path = "fuzz_targets/region.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "user_dirs"
+path = "fuzz_targets/user_dirs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_parse"
+path = "fuzz_targets/config_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "file_uri"
+path = "fuzz_targets/file_uri.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stamp_names"
+path = "fuzz_targets/stamp_names.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "png_header"
+path = "fuzz_targets/png_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "redact_text"
+path = "fuzz_targets/redact_text.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "comm_label"
+path = "fuzz_targets/comm_label.rs"
+test = false
+doc = false
+bench = false

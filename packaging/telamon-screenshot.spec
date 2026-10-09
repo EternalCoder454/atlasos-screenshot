@@ -6,7 +6,7 @@
 %global app_id net.eterneon.telamon.screenshot
 
 Name:           telamon-screenshot
-Version:        0.3.0
+Version:        0.4.0
 Release:        1%{?dist}
 Summary:        Screenshots for Telamon OS: screen, window or region, copied, saved and annotated
 License:        MIT
@@ -24,6 +24,8 @@ BuildRequires:  rust-srpm-macros
 BuildRequires:  gcc
 BuildRequires:  pkgconfig(xkbcommon)
 BuildRequires:  desktop-file-utils
+# readelf, for scripts/check-hardening.sh in %%check
+BuildRequires:  binutils
 # The editor
 BuildRequires:  gcc-c++
 BuildRequires:  cmake
@@ -95,11 +97,14 @@ does it): the two can't own org.kde.Spectacle and Print together.
 # offline mock/Koji build). CARGO_HOME from the environment keeps a crate cache.
 export CARGO_HOME=${CARGO_HOME:-%{_builddir}/cargo-home}
 export RUSTFLAGS="%{build_rustflags} --remap-path-prefix=$PWD=. --remap-path-prefix=$CARGO_HOME=cargo"
+# The C code cargo builds (ring) gets Fedora's flags too: stack protector,
+# fortify, CET, stack clash protection. strip stays off here (the profile's
+# strip = true is what leaves the binary small; %%check reads dynamic symbols).
+export CFLAGS="%{build_cflags} -ffile-prefix-map=$PWD=. -ffile-prefix-map=$CARGO_HOME=cargo"
 cargo build --release --locked
 
 # The editor, in its own build tree (the cargo one is target/). Its tests are
 # built too, and run in %%check; they are not installed.
-export CFLAGS="%{build_cflags} -ffile-prefix-map=$PWD=."
 export CXXFLAGS="%{build_cxxflags} -ffile-prefix-map=$PWD=."
 %global _vpath_srcdir editor
 %cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DTELAMON_EDITOR_TESTS=ON
@@ -134,6 +139,33 @@ grep -qx 'Exec=%{_bindir}/telamon-screenshot-editor %%f' %{buildroot}%{_datadir}
 desktop-file-validate %{buildroot}%{_datadir}/applications/%{app_id}.editor.desktop
 grep -qx 'X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2' %{buildroot}%{_datadir}/applications/%{app_id}.desktop
 desktop-file-validate %{buildroot}%{_datadir}/applications/%{app_id}.desktop
+# The capture grant: exactly one restricted interface (ScreenShot2) is asked
+# for, only by the CLI's desktop file (and its kglobalaccel copy), and never
+# by the editor, which parses untrusted images and so gets no capture right.
+for f in %{buildroot}%{_datadir}/applications/%{app_id}.desktop %{buildroot}%{_datadir}/kglobalaccel/%{app_id}.desktop; do
+    test "$(grep -c '^X-KDE-.*Interfaces=' "$f")" = 1
+done
+if grep -q '^X-KDE-.*Interfaces=' %{buildroot}%{_datadir}/applications/%{app_id}.editor.desktop; then
+    echo "the editor's desktop file asks for a restricted interface" >&2
+    exit 1
+fi
+# Every Exec= of the CLI's desktop file runs the one installed binary.
+if grep '^Exec=' %{buildroot}%{_datadir}/applications/%{app_id}.desktop | grep -vE '^Exec=%{_bindir}/telamon-screenshot(-editor)?( --[a-z-]+)?$'; then
+    echo "an Exec= line of the desktop file runs something else" >&2
+    exit 1
+fi
+# The D-Bus service starts that binary and owns only the Spectacle name.
+test "$(grep -c '^Name=' %{buildroot}%{_datadir}/dbus-1/services/org.kde.Spectacle.service)" = 1
+# PIE, full RELRO (BIND_NOW), non-executable stack, no text relocations, no
+# RPATH; the editor (C++) also has the stack protector. Rust has none on
+# stable, so for the CLI that is a notice.
+scripts/check-hardening.sh --rust %{buildroot}%{_bindir}/telamon-screenshot
+scripts/check-hardening.sh %{buildroot}%{_bindir}/telamon-screenshot-editor
+# No setuid, setgid or world-writable file in the package.
+if find %{buildroot} -type f \( -perm /6000 -o -perm -0002 \) -print | grep .; then
+    echo "the package holds a setuid, setgid or world-writable file" >&2
+    exit 1
+fi
 export CARGO_HOME=${CARGO_HOME:-%{_builddir}/cargo-home}
 cargo test --release --locked
 # The editor's tests: the C++ backend and the Qt Quick ones, on the offscreen
@@ -155,6 +187,16 @@ cargo test --release --locked
 %{_datadir}/dbus-1/services/org.kde.Spectacle.service
 
 %changelog
+* Thu Oct 08 2026 EternalHell <77252745+EternalCoder454@users.noreply.github.com> - 0.4.0-1
+- Secure phase. A capture asked for over D-Bus (org.kde.Spectacle) is never silent: it ends in a
+  notification that names the calling program whatever output.notify says, the captures that need
+  no gesture show the one second countdown first, and requests are limited to one every 3 seconds
+- Core dumps are off for the CLI and the editor (they hold screen contents); the notification's
+  Open button runs /usr/bin/xdg-open; the editor no longer lets the environment choose the
+  program it runs, opens files once (no FIFO or swap race) and saves new files 0600
+- The package build checks the binaries' hardening (PIE, full RELRO, no executable stack, no
+  RPATH) and that only the CLI is granted ScreenShot2; releases check integer overflow
+
 * Wed Oct 07 2026 EternalHell <77252745+EternalCoder454@users.noreply.github.com> - 0.3.0-1
 - Replaces KDE Spectacle (without screen recording): whole desktop, screen, active window, a
   window you click, or a region; saved to Pictures/Screenshots, copied, and a notification with
