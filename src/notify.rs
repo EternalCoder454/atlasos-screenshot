@@ -218,7 +218,7 @@ pub fn next_event(events: &mut MessageIterator, id: u32, sender: &str) -> Option
 
 /// The body may be read as markup (`<b>`, `<a href>`); the text can hold
 /// paths and config parser messages, so it goes out as plain text.
-fn escape(s: &str) -> String {
+pub(crate) fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {

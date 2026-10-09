@@ -41,8 +41,8 @@ const BURST_WINDOW: Duration = Duration::from_secs(600);
 const VISIBLE_DELAY: &str = "1";
 /// What a caller is called when its program can't be found out, and when it
 /// is a Flatpak's D-Bus proxy (the proxy's process is not the app's).
-const UNKNOWN: &str = "an unknown program";
-const SANDBOXED: &str = "a sandboxed app";
+pub(crate) const UNKNOWN: &str = "an unknown program";
+pub(crate) const SANDBOXED: &str = "a sandboxed app";
 
 struct Service {
     shared: Arc<Shared>,
@@ -101,7 +101,7 @@ fn plain_name(raw: &[u8], max: usize) -> String {
 /// itself), so it is defanged; `exe` is the name of the file it runs, which
 /// it cannot choose: when that file is not what `comm` says, it is added
 /// (`kdeconnect (python3.14)`), so a program cannot pass for another one.
-fn label(comm: &[u8], exe: Option<&[u8]>) -> String {
+pub(crate) fn label(comm: &[u8], exe: Option<&[u8]>) -> String {
     let name = plain_name(comm, 15);
     if name.is_empty() {
         return UNKNOWN.to_string();

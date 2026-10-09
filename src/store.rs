@@ -56,7 +56,7 @@ fn read_small(path: &Path) -> Option<String> {
 
 /// The value of `XDG_<name>_DIR="..."` in a `user-dirs.dirs` file; `$HOME`
 /// at its start is the home folder. Relative or odd values are ignored.
-fn user_dir_from(text: &str, name: &str, home: &Path) -> Option<PathBuf> {
+pub(crate) fn user_dir_from(text: &str, name: &str, home: &Path) -> Option<PathBuf> {
     let key = format!("XDG_{name}_DIR=");
     let value = text
         .lines()
@@ -112,12 +112,7 @@ pub fn save_png(dir: &Path, png: &[u8]) -> Result<PathBuf, String> {
         ));
     }
     let stamp = local_stamp(std::time::SystemTime::now());
-    let names: Vec<String> = (0..100)
-        .map(|n| match n {
-            0 => format!("Screenshot_{stamp}.png"),
-            n => format!("Screenshot_{stamp}-{n}.png"),
-        })
-        .collect();
+    let names = names(&stamp);
     let saved = match save_unnamed(&dfd, png, &names) {
         Ok(Some(name)) => Ok(Some(name)),
         Ok(None) => save_renamed(&dfd, png, &names),
@@ -134,6 +129,17 @@ pub fn save_png(dir: &Path, png: &[u8]) -> Result<PathBuf, String> {
     }
 }
 
+/// The names tried for a stamp, in order: `Screenshot_<stamp>.png`, then
+/// `Screenshot_<stamp>-1.png` to `-99.png`.
+pub(crate) fn names(stamp: &str) -> Vec<String> {
+    (0..100)
+        .map(|n| match n {
+            0 => format!("Screenshot_{stamp}.png"),
+            n => format!("Screenshot_{stamp}-{n}.png"),
+        })
+        .collect()
+}
+
 fn write_synced(fd: rustix::fd::OwnedFd, png: &[u8]) -> std::io::Result<()> {
     let mut f = std::fs::File::from(fd);
     f.write_all(png)?;
@@ -144,7 +150,7 @@ const SAVE_MODE: rustix::fs::Mode = rustix::fs::Mode::RUSR.union(rustix::fs::Mod
 
 /// `O_TMPFILE` + `linkat`. `Ok(None)` (before anything is visible) when the
 /// file system or a missing /proc rules it out.
-fn save_unnamed(
+pub(crate) fn save_unnamed(
     dfd: &rustix::fd::OwnedFd,
     png: &[u8],
     names: &[String],
@@ -178,7 +184,7 @@ fn save_unnamed(
 }
 
 /// A random temp name, renamed without replacing. `Ok(None)`: no free name.
-fn save_renamed(
+pub(crate) fn save_renamed(
     dfd: &rustix::fd::OwnedFd,
     png: &[u8],
     names: &[String],
@@ -218,7 +224,7 @@ fn save_renamed(
 const MAX_STAMP_SECS: i64 = 253_402_300_799;
 
 /// The time on the user's clock (the UTC stamp shifted by the local offset).
-fn local_stamp(t: std::time::SystemTime) -> String {
+pub(crate) fn local_stamp(t: std::time::SystemTime) -> String {
     let secs = t
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_secs()).unwrap_or(MAX_STAMP_SECS))
@@ -239,7 +245,7 @@ fn local_stamp(t: std::time::SystemTime) -> String {
 }
 
 /// `20261005_174012` (UTC), from the civil-from-days algorithm.
-fn utc_stamp(t: std::time::SystemTime) -> String {
+pub(crate) fn utc_stamp(t: std::time::SystemTime) -> String {
     let secs = t
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_secs()).unwrap_or(MAX_STAMP_SECS))

@@ -1,0 +1,5 @@
+[overlay]
+dim = 0.9
+accent = "#112233"
+[output]
+save_dir = "/srv/shots"

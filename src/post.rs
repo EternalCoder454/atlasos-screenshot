@@ -74,7 +74,7 @@ pub fn finish(done: Done) {
 
 /// The job as the helper reads it: `name:length\n` and that many bytes, for
 /// each field that is set.
-fn encode(d: &Done) -> Vec<u8> {
+pub(crate) fn encode(d: &Done) -> Vec<u8> {
     let mut out = Vec::new();
     let mut put = |name: &str, bytes: &[u8]| {
         out.extend_from_slice(format!("{name}:{}\n", bytes.len()).as_bytes());
@@ -109,7 +109,7 @@ fn encode(d: &Done) -> Vec<u8> {
 /// is far below it).
 const MAX_JOB: u64 = 320 * 1024 * 1024;
 
-fn decode(input: impl Read) -> Result<Done, String> {
+pub(crate) fn decode(input: impl Read) -> Result<Done, String> {
     let mut data = Vec::new();
     input
         .take(MAX_JOB + 1)

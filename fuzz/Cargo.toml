@@ -1,20 +1,26 @@
 [package]
-name = "telamon-screenshot"
-version = "0.4.0"
+name = "telamon-screenshot-fuzz"
+version = "0.0.0"
 edition = "2024"
-rust-version = "1.88"
-description = "Region screenshots to the Wayland clipboard: image, OCR text or redacted image"
-license = "MIT"
-repository = "https://github.com/EternalCoder454/atlasos-screenshot"
 publish = false
+description = "cargo-fuzz targets for the parsers of Telamon Screenshot's CLI (not part of the build; needs nightly)"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Its own workspace and lock file: the fuzzer builds with sanitizers on
+# nightly and must not change the application's Cargo.lock.
+[workspace]
 
 [features]
+# As in the application: the OCR code is part of what is built (and checked).
 default = ["ocr"]
-# Ctrl+drag (text) and Alt+drag (redact). Without it, both modes report that
-# OCR isn't built in.
 ocr = ["dep:ocrs", "dep:rten", "dep:ureq", "dep:ring"]
 
 [dependencies]
+libfuzzer-sys = "=0.4.13"
+# The application's own dependencies, at the same versions (src/*.rs are
+# compiled into this crate by fuzz/src/lib.rs).
 # Wayland: capture backends and the selection overlay
 wayland-client = "0.31.15"
 wayland-protocols = { version = "0.32.13", features = ["client", "staging"] }
@@ -42,21 +48,76 @@ serde = { version = "1.0.229", features = ["derive"] }
 toml = { version = "1.1", default-features = false, features = ["parse", "serde"] }
 
 [profile.release]
-# Secure phase: arithmetic on sizes and offsets that come from KWin, the
-# compositor, files and pipes aborts (panic = "abort", with a notification)
-# instead of wrapping. Its cost is to be measured in the Performant phase.
+debug = 1
 overflow-checks = true
-opt-level = 3
-lto = true
-codegen-units = 1
-panic = "abort"
-strip = true
+panic = "unwind"
 
-# OCR is unusably slow without optimisation, even in debug builds.
-[profile.dev.package."*"]
-opt-level = 2
+[[bin]]
+name = "post_decode"
+path = "fuzz_targets/post_decode.rs"
+test = false
+doc = false
+bench = false
 
-[dev-dependencies]
-# Property tests of the parsers (src/proptests.rs). Exact version; only `std`:
-# no `fork` or `timeout` (they spawn processes and threads), no bit-set.
-proptest = { version = "=1.11.0", default-features = false, features = ["std"] }
+[[bin]]
+name = "cli_args"
+path = "fuzz_targets/cli_args.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "region"
+path = "fuzz_targets/region.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "user_dirs"
+path = "fuzz_targets/user_dirs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_parse"
+path = "fuzz_targets/config_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "file_uri"
+path = "fuzz_targets/file_uri.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stamp_names"
+path = "fuzz_targets/stamp_names.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "png_header"
+path = "fuzz_targets/png_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "redact_text"
+path = "fuzz_targets/redact_text.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "comm_label"
+path = "fuzz_targets/comm_label.rs"
+test = false
+doc = false
+bench = false

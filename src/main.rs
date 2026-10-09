@@ -31,13 +31,13 @@ mod modes;
 mod notify;
 mod ocr;
 mod overlay;
+mod pngin;
 mod post;
 mod redact;
 mod store;
 mod watchdog;
 
 use std::fs::OpenOptions;
-use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -127,43 +127,18 @@ fn helper(cfg: &Config) -> Result<bool, String> {
     match action {
         Action::Dbus => dbus::serve().map(|()| true),
         Action::SavePng => {
-            let png = read_png(std::io::stdin().lock())?;
+            let png = pngin::read_png(std::io::stdin().lock())?;
             let path = save_capture(&png, cfg)?;
             println!("{}", path.display());
             Ok(true)
         }
         Action::CopyPng => {
-            let png = read_png(std::io::stdin().lock())?;
+            let png = pngin::read_png(std::io::stdin().lock())?;
             clipboard::copy(Payload::Png(png))?;
             Ok(true)
         }
         _ => Ok(false),
     }
-}
-
-/// The biggest PNG taken from stdin.
-const MAX_STDIN_PNG: u64 = 256 * 1024 * 1024;
-
-/// A PNG from `input`, checked: the signature, and a size that is a screen's
-/// and not a bomb's. The bytes are kept as they are.
-fn read_png(input: impl Read) -> Result<Vec<u8>, String> {
-    use image::ImageDecoder;
-
-    let mut png = Vec::new();
-    input
-        .take(MAX_STDIN_PNG + 1)
-        .read_to_end(&mut png)
-        .map_err(|e| format!("can't read the picture: {e}"))?;
-    if png.len() as u64 > MAX_STDIN_PNG {
-        return Err("the picture is too large".into());
-    }
-    let dec = image::codecs::png::PngDecoder::new(std::io::Cursor::new(&png))
-        .map_err(|_| "that is not a PNG picture".to_string())?;
-    let (w, h) = dec.dimensions();
-    if w == 0 || h == 0 || w > 16384 || h > 16384 {
-        return Err(format!("a {w}x{h} picture is too large"));
-    }
-    Ok(png)
 }
 
 /// `Ok(false)` when the user cancelled.
@@ -467,6 +442,11 @@ fn encode_png(img: &image::RgbaImage) -> Result<Vec<u8>, String> {
 }
 
 #[cfg(test)]
+mod checks;
+#[cfg(test)]
+mod proptests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -527,12 +507,16 @@ mod tests {
     fn stdin_pictures_are_checked() {
         let img = image::RgbaImage::from_pixel(3, 2, image::Rgba([1, 2, 3, 255]));
         let png = encode_png(&img).unwrap();
-        assert_eq!(read_png(&png[..]).unwrap(), png);
-        assert!(read_png(&b"GIF89a"[..]).is_err());
-        assert!(read_png(&b""[..]).is_err());
+        assert_eq!(pngin::read_png(&png[..]).unwrap(), png);
+        assert!(pngin::read_png(&b"GIF89a"[..]).is_err());
+        assert!(pngin::read_png(&b""[..]).is_err());
         // Too wide for a screen: refused.
         let wide = encode_png(&image::RgbaImage::new(16385, 1)).unwrap();
-        assert!(read_png(&wide[..]).unwrap_err().contains("too large"));
+        assert!(
+            pngin::read_png(&wide[..])
+                .unwrap_err()
+                .contains("too large")
+        );
     }
 
     #[test]
