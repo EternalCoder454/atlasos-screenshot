@@ -4,6 +4,8 @@
 // a separate executable so the snip path of telamon-screenshot stays free of
 // a toolkit. FILE is an image to open, "-" reads the image from stdin, no
 // argument opens the empty state. Several instances may run at once.
+#include "harden.h"
+
 #include <QCommandLineParser>
 #include <QApplication>
 #include <QIcon>
@@ -13,6 +15,8 @@
 #include <QSGRendererInterface>
 
 #ifdef TELAMON_EDITOR_TEST_HOOKS
+#include "backend.h"
+
 #include <QDateTime>
 #include <QFile>
 #include <QJSEngine>
@@ -26,6 +30,16 @@ using namespace Qt::StringLiterals;
 
 int main(int argc, char *argv[])
 {
+    // Before anything holds a pixel: no core dump of a process with the screen in it.
+    shot::hardenProcess();
+
+#ifdef TELAMON_EDITOR_TEST_HOOKS
+    // Only the test build lets the environment choose the CLI (the shipped
+    // editor always runs /usr/bin/telamon-screenshot).
+    if (qEnvironmentVariableIsSet("TELAMON_SCREENSHOT_BIN"))
+        Backend::setCliPathForTests(qEnvironmentVariable("TELAMON_SCREENSHOT_BIN"));
+#endif
+
     // Draw on the CPU like the other Telamon apps: for a window of an image
     // and a few shapes the GPU path costs memory and start-up time for
     // nothing. QT_QUICK_BACKEND overrides.

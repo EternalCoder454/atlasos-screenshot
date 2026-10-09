@@ -70,8 +70,12 @@ public:
 
     Q_INVOKABLE QString baseName(const QString &path) const;
 
-    // The CLI the helpers run: $TELAMON_SCREENSHOT_BIN (for tests), else /usr/bin/telamon-screenshot.
+    // The CLI the helpers run: always /usr/bin/telamon-screenshot. The
+    // environment is never read here (a variable must not choose which program
+    // the shipped editor runs with the user's screenshots on its stdin). Only
+    // the tests change it, through the seam below, before any Backend works.
     static QString cliPath();
+    static void setCliPathForTests(const QString &path);
 
 signals:
     void imageChanged();

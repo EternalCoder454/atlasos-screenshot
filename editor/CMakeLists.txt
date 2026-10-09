@@ -37,6 +37,8 @@ qt_add_qml_module(editorcore
         src/backend.cpp
         src/canvasview.h
         src/canvasview.cpp
+        src/harden.h
+        src/harden.cpp
     QML_FILES
         qml/Main.qml
         qml/CanvasStage.qml
@@ -73,6 +75,7 @@ if(TELAMON_EDITOR_TESTS)
     set_target_properties(telamon-screenshot-editor-test PROPERTIES _QT_QML_PLUGINS_IMPORTED TRUE)
 
     qt_add_executable(tst_backend tests/tst_backend.cpp)
+    target_compile_definitions(tst_backend PRIVATE QML_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/qml")
     target_link_libraries(tst_backend PRIVATE ${EDITOR_LIBS} Qt6::Test)
     set_target_properties(tst_backend PROPERTIES _QT_QML_PLUGINS_IMPORTED TRUE)
     add_test(NAME backend COMMAND tst_backend)
