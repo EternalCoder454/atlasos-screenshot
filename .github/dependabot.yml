@@ -1,0 +1,42 @@
+# Weekly update pull requests: the Rust crates (the package and the fuzz
+# crate) and the pinned GitHub Actions. Updates are grouped, so one pull
+# request a week per ecosystem. The actions are pinned by commit SHA with the
+# tag in a comment, and Dependabot rewrites both. The atlas-framework pin in
+# ci.yml is moved by hand, with the telamon-ui version the spec asks for.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    groups:
+      rust-crates:
+        patterns: ["*"]
+    commit-message:
+      prefix: "Dependencies"
+
+  - package-ecosystem: cargo
+    directory: /fuzz
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+    groups:
+      fuzz-crates:
+        patterns: ["*"]
+    commit-message:
+      prefix: "Dependencies (fuzz)"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "CI"

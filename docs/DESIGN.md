@@ -98,7 +98,7 @@ path at once.
   the overlay, so any process of the user's can take a screenshot without a
   gesture by running the binary. That matches `spectacle --background` on
   stock Plasma, and KWin's grant is by path, so the binary in root-owned
-  `/usr/bin` can't be swapped. Accepted as parity.
+  `/usr/bin` can't be swapped. Accepted as parity (see `SECURITY.md`).
 - **Notifications.** The body is escaped, because the server may read it as
   markup. The buttons are a fixed set (`open`, `folder`, `edit`, `copy`, and
   the body click as `default`); a key the server sends that is not one of them
@@ -113,8 +113,12 @@ path at once.
   side, decoded header only) so the editor needs no file or clipboard code.
   `--dbus` owns `org.kde.Spectacle` and answers each method by running this
   program with fixed flags (the `-1/0/1` arguments choose among them); it
-  takes no path or text from the caller. Any process of the user's could ask
-  for a screenshot over D-Bus; that is what Spectacle's service allows too.
+  takes no path or text from the caller, and returns only the saved file's
+  path. A capture asked for this way is never silent: `--notify` (a
+  notification whatever `output.notify` says), `--requested-by` (the calling
+  program's name, from the bus daemon and `/proc`), a one second `--delay`
+  countdown unless the user picks on screen anyway, and at most one request
+  every 3 seconds. See `SECURITY.md`.
 - **Network.** Only for the models: fixed HTTPS URLs on one host, no
   redirects, rustls with bundled roots. Timeouts are 10 s to connect and
   60 s per file, the body is capped at the expected size + 64 KiB, and there
@@ -134,6 +138,10 @@ path at once.
   reported, and the copy still happens.
 - **Redaction** is an opaque fill, never a blur. It is best-effort and
   documented as such.
+- **Process.** `RLIMIT_CORE` is 0 in the CLI and the editor (and so in what
+  they start): they hold screen contents and a crash must not write them out.
+  `PR_SET_DUMPABLE` is not used: KWin reads `/proc/<pid>/exe` to grant
+  ScreenShot2. Release builds check integer overflow.
 
 ## Overlay entry and exit (KWin animations)
 

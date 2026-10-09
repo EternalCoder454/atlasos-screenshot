@@ -36,6 +36,7 @@ telamon-screenshot [WHAT] [OPTIONS]
   --delay N               wait N seconds (0-600) with a countdown that is never in the picture
   --mode image|text|redact    what the capture becomes (default image)
   --no-save  --no-notify  --edit  --cursor/--no-cursor  --no-frame  --no-shadow
+  --notify                notify even when output.notify is false
 ```
 
 Exit status: 0 done, 1 cancelled or failed, 2 bad arguments. The path of the
@@ -77,7 +78,11 @@ launcher's "Open the Editor".
 `StartAgent`, `OpenWithoutScreenshot`, with `ScreenshotTaken` and
 `ScreenshotFailed`; the `Record*` methods answer `RecordingFailed`). The
 `telamon-screenshot-spectacle-compat` package starts it on demand and conflicts
-with `spectacle`.
+with `spectacle`. A picture asked for this way is never silent: it ends in a
+notification that names the program that asked, whatever `output.notify` says,
+the captures that need no click wait one second behind the countdown, and
+requests come at most every 3 seconds. The caller only learns the saved file's
+path. See `docs/SECURITY.md`.
 
 ## How it works
 

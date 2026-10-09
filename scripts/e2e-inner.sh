@@ -32,6 +32,11 @@ if [ "${1:-}" != --in-session ]; then
 #!/bin/sh
 echo "$*" >>/out/xdg-open.log
 STUB
+        # A look-alike earlier on PATH (as ~/.local/bin could be): never run.
+        install -m755 /dev/stdin /usr/local/bin/xdg-open <<'STUB'
+#!/bin/sh
+echo "$*" >>/out/xdg-open-decoy.log
+STUB
         install -m755 /dev/stdin /usr/bin/telamon-screenshot-editor <<'STUB'
 #!/bin/sh
 echo "$*" >>/out/editor.log
@@ -236,9 +241,24 @@ sys.exit(0 if im.mode == "RGBA" and im.getchannel("A").getextrema()[0] < 255 els
     shot --region 0,0,640x400
     rf=$f
     : >/out/xdg-open.log
+    # Another program on the bus emits the server's signals for our
+    # notification: Open (and a made-up action) must not run.
+    nid=$(notif id)
+    for key in open default folder edit copy; do
+        gdbus emit --session --object-path /org/freedesktop/Notifications \
+            --signal org.freedesktop.Notifications.ActionInvoked "$nid" "$key" >/dev/null 2>&1
+    done
+    gdbus emit --session --object-path /org/freedesktop/Notifications \
+        --signal org.freedesktop.Notifications.NotificationClosed "$nid" 2 >/dev/null 2>&1
+    sleep 1.5
+    check "buttons: signals forged by another program on the bus do nothing" \
+        $([ ! -s /out/xdg-open.log ] && ! grep -qF '"kind": "show-items"' /out/notify.log; echo $?)
+    check "buttons: the helper still serves the real server after the forgeries" \
+        $(pgrep -f 'telamon-screenshot --post' >/dev/null; echo $?)
     click open
     waitfor 5 grep -qxF "$rf" /out/xdg-open.log
     check "button Open: xdg-open gets the file as one argument" $?
+    check "button Open: a look-alike xdg-open earlier on PATH is not run" $([ ! -s /out/xdg-open-decoy.log ]; echo $?)
     shot --region 0,0,640x400
     rf=$f
     : >/out/xdg-open.log
@@ -378,10 +398,42 @@ PY
     for m in StartAgent FullScreen CurrentScreen ActiveWindow WindowUnderCursor RectangularRegion RecordRegion RecordScreen RecordWindow OpenWithoutScreenshot; do
         grep -q "$m" /out/spectacle-introspect.txt || { echo "missing $m"; fails=$((fails + 1)); }
     done
+    # The notification of that first request: never silent, names the caller.
+    check "Spectacle D-Bus: the capture ends in a notification that names the caller" \
+        $([ "$(notif summary)" = "Screenshot Saved" ] && [[ "$(notif body)" == *"Requested by gdbus over D-Bus."* ]]; echo $?)
+    taken() { grep -c ScreenshotTaken /out/spectacle-signals.log; }
+    failed() { grep -c ScreenshotFailed /out/spectacle-signals.log; }
+    # Right after a capture, one more is refused (one every 3 seconds).
+    f0=$(failed); n0=$(nn)
+    gdbus call --session --dest org.kde.Spectacle --object-path / --method org.kde.Spectacle.FullScreen -- -1 >/dev/null 2>&1
+    more_failed() { [ "$(failed)" -gt "$f0" ]; }
+    waitfor 5 more_failed
+    check "Spectacle D-Bus: a second request right after is refused (rate limit)" $?
+    check "Spectacle D-Bus: the refused request took no picture and showed nothing" $([ "$(nn)" = "$n0" ]; echo $?)
+    sleep 3.5
+    t0=$(taken)
     gdbus call --session --dest org.kde.Spectacle --object-path / --method org.kde.Spectacle.ActiveWindow -- 0 0 0 >/dev/null 2>&1
-    two_taken() { [ "$(grep -c ScreenshotTaken /out/spectacle-signals.log)" -ge 2 ]; }
+    two_taken() { [ "$(taken)" -gt "$t0" ]; }
     waitfor 15 two_taken
     check "Spectacle D-Bus: ActiveWindow(0,0,0) answers too" $?
+    # output.notify = false is the user's choice for their own captures only.
+    mkdir -p "$XDG_CONFIG_HOME/telamon-screenshot"
+    printf '[output]\nnotify = false\n' >"$XDG_CONFIG_HOME/telamon-screenshot/config.toml"
+    sleep 3.5
+    t0=$(taken); n0=$(nn)
+    gdbus call --session --dest org.kde.Spectacle --object-path / --method org.kde.Spectacle.CurrentScreen -- -1 >/dev/null 2>&1
+    waitfor 15 two_taken
+    more_notified() { [ "$(nn)" -gt "$n0" ]; }
+    waitfor 5 more_notified
+    check "Spectacle D-Bus: with output.notify = false it still notifies, naming the caller" \
+        $([ "$(nn)" -gt "$n0" ] && [[ "$(notif body)" == *"Requested by gdbus over D-Bus."* ]]; echo $?)
+    rm -f "$XDG_CONFIG_HOME/telamon-screenshot/config.toml"
+    # And the countdown shows first: the call takes at least a second.
+    sleep 3.5
+    t0=$(taken); s0=$(ms)
+    gdbus call --session --dest org.kde.Spectacle --object-path / --method org.kde.Spectacle.FullScreen -- -1 >/dev/null 2>&1
+    waitfor 15 two_taken
+    check "Spectacle D-Bus: a capture that needs no gesture waits the one second countdown" $([ $(($(ms) - s0)) -ge 1000 ]; echo $?)
 
     # --- the real editor, from the CLI, in this session: the stub is replaced
     # by the editor's test build, which grabs its own window to a PNG once it
