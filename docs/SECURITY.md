@@ -47,7 +47,7 @@ How each way in checks that:
 | Hotkey or launcher (`.desktop` actions) | Pressing it | The overlay (region, window picker) or nothing before the capture (whole desktop, screen, active window); then a notification | The user's own action. `output.notify` and `--no-notify` are the user's to set. |
 | Command line | Running it | As above, as configured | A program that runs the binary is the user's own program (see "Accepted"). |
 | `--delay N` | Starting it | A countdown badge that is never in the picture | Bounded to 600 s. |
-| `org.kde.Spectacle` over D-Bus | **None**: any program on the bus | A one second countdown badge first (whole desktop, screen, active window) or the overlay (region, window picker); **always** a notification that names the calling program, whatever `output.notify` says | Requests come at most once every 3 seconds. See below. |
+| `org.kde.Spectacle` over D-Bus | **None**: any program on the bus | A one second countdown badge first (whole desktop, screen, active window) or the overlay (region, window picker); **always** a notification that names the calling program, whatever `output.notify` says | Requests come at most once every 3 seconds and ten in ten minutes. See below. |
 | Notification buttons | Clicking them | The result | The buttons are a fixed set. |
 
 ### What a caller of `org.kde.Spectacle` gets
@@ -72,13 +72,24 @@ programs that ask Spectacle keep working. What a caller can and cannot do:
   notification even when `output.notify = false`) and `--requested-by NAME`,
   where NAME is the `comm` of the process that owns the calling connection
   (asked from the bus daemon, `GetConnectionCredentials`, then `/proc`),
-  defanged to letters, digits and a few marks. A Flatpak app is named "a
-  sandboxed app" (its bus connection is its proxy's). The captures that need
-  no gesture show the countdown badge for one second first. `Record*`
-  answers `RecordingFailed`.
-- **It cannot flood.** One capture at a time, and a new request is refused
-  (`ScreenshotFailed`) within 3 seconds of the last accepted one. A refused
-  request starts nothing and shows nothing.
+  defanged to letters, digits and a few marks. A program can rename itself,
+  so when the file it runs (`/proc/<pid>/exe`, which it cannot choose) is not
+  what `comm` says, that is added: `kdeconnectd (python3.14)`. A Flatpak app
+  is named "a sandboxed app" (its bus connection is its proxy's). A caller
+  that sends and exits before the lookup is "an unknown program". The name
+  is a hint for the user, not proof of identity. The captures that need no
+  gesture show the countdown badge for one second first. `Record*` answers
+  `RecordingFailed`. The notification is best effort: it is not shown if
+  there is no notification server, and Plasma's Do Not Disturb may hold the
+  pop-up back (it stays in the history).
+- **It cannot flood the disk or the clipboard unboundedly.** One capture at a
+  time, a new request is refused (`ScreenshotFailed`) within 3 seconds of the
+  last accepted one, and at most 10 captures are accepted in any 10 minutes,
+  for all callers together. A refused request starts nothing and shows
+  nothing. The limit is global, not per caller, so one noisy program can use
+  up the allowance of a legitimate one for a while; that is the price of not
+  trusting a caller's name. `ScreenshotFailed` is a broadcast, so a program
+  with a request in flight may see another's refusal.
 - **It can still** make a capture happen, land a PNG in `Pictures/Screenshots`
   and replace the clipboard, with a visible notification. That is what
   Spectacle's own service allows and what KDE Connect and scripts rely on;
@@ -251,6 +262,10 @@ is refused, not used.
    "file exists" prompt follows it too.
 8. **Unit tests use predictable temp folders under `$TMPDIR`**, created fresh;
    they are not part of the shipped program.
+9. **CI containers use the `fedora:44` tag, not a digest**, so security
+   updates arrive with the next run; a moved tag is Fedora's to account for.
+   Actions are pinned by commit. `CODEOWNERS` protects what it lists only if
+   the repository's branch protection requires code-owner review.
 
 ## What would change this
 

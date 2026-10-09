@@ -81,7 +81,7 @@ launcher's "Open the Editor".
 with `spectacle`. A picture asked for this way is never silent: it ends in a
 notification that names the program that asked, whatever `output.notify` says,
 the captures that need no click wait one second behind the countdown, and
-requests come at most every 3 seconds. The caller only learns the saved file's
+requests are rate-limited. The caller only learns the saved file's
 path. See `docs/SECURITY.md`.
 
 ## How it works

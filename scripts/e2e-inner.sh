@@ -246,10 +246,10 @@ sys.exit(0 if im.mode == "RGBA" and im.getchannel("A").getextrema()[0] < 255 els
     nid=$(notif id)
     for key in open default folder edit copy; do
         gdbus emit --session --object-path /org/freedesktop/Notifications \
-            --signal org.freedesktop.Notifications.ActionInvoked "$nid" "$key" >/dev/null 2>&1
+            --signal org.freedesktop.Notifications.ActionInvoked "uint32 $nid" "$key" >/dev/null 2>&1
     done
     gdbus emit --session --object-path /org/freedesktop/Notifications \
-        --signal org.freedesktop.Notifications.NotificationClosed "$nid" 2 >/dev/null 2>&1
+        --signal org.freedesktop.Notifications.NotificationClosed "uint32 $nid" "uint32 2" >/dev/null 2>&1
     sleep 1.5
     check "buttons: signals forged by another program on the bus do nothing" \
         $([ ! -s /out/xdg-open.log ] && ! grep -qF '"kind": "show-items"' /out/notify.log; echo $?)

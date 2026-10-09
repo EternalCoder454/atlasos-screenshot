@@ -117,8 +117,8 @@ path at once.
   path. A capture asked for this way is never silent: `--notify` (a
   notification whatever `output.notify` says), `--requested-by` (the calling
   program's name, from the bus daemon and `/proc`), a one second `--delay`
-  countdown unless the user picks on screen anyway, and at most one request
-  every 3 seconds. See `SECURITY.md`.
+  countdown unless the user picks on screen anyway, and a rate limit (one
+  request every 3 seconds, ten every ten minutes). See `SECURITY.md`.
 - **Network.** Only for the models: fixed HTTPS URLs on one host, no
   redirects, rustls with bundled roots. Timeouts are 10 s to connect and
   60 s per file, the body is capped at the expected size + 64 KiB, and there

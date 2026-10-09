@@ -64,4 +64,4 @@ crate) and `editor/`, the Qt/QML annotation editor (own CMake build).
 | Dependency audit | `cargo deny --locked check advisories bans licenses sources` (CI: `audit.yml`) |
 | Hardening of a build | `scripts/check-hardening.sh [--rust] <elf>` (the spec's `%check` runs it) |
 | Fuzz | see `fuzz/run.sh` (nightly, cargo-fuzz; CI: `fuzz.yml`) |
-| RPM | `podman run --rm --init --security-opt label=disable -v "$PWD":/src:ro -v <out>:/out -v telamon-cargo:/root/.cargo/registry -e CARGO_HOME=/root/.cargo registry.fedoraproject.org/fedora:44 /src/packaging/build-rpm.sh /out` |
+| RPM | `podman run --rm --init --security-opt label=disable --ulimit core=0 -v "$PWD":/src:ro -v <out>:/out -v telamon-cargo:/root/.cargo/registry -e CARGO_HOME=/root/.cargo registry.fedoraproject.org/fedora:44 /src/packaging/build-rpm.sh /out` |

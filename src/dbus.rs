@@ -20,6 +20,7 @@
 //! reaches the command line except as one of the fixed flags below.
 
 use std::ffi::OsString;
+use std::os::unix::ffi::OsStrExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -30,8 +31,12 @@ use zbus::blocking::Connection;
 const NAME: &str = "org.kde.Spectacle";
 const PATH: &str = "/";
 const IDLE_EXIT: Duration = Duration::from_secs(15);
-/// The least time between two requests that start a capture.
+/// The least time between two requests that start a capture, and the most
+/// that start one in `BURST_WINDOW`: a program that asks in a loop gets
+/// refusals, not a clipboard replaced every few seconds.
 const MIN_GAP: Duration = Duration::from_secs(3);
+const BURST: usize = 10;
+const BURST_WINDOW: Duration = Duration::from_secs(600);
 /// The countdown shown before a capture that asks nothing of the user.
 const VISIBLE_DELAY: &str = "1";
 /// What a caller is called when its program can't be found out, and when it
@@ -50,44 +55,67 @@ struct Shared {
     limiter: Mutex<Limiter>,
 }
 
-/// Lets one request through per `MIN_GAP`.
+/// Lets one request through per `MIN_GAP`, and `BURST` per `BURST_WINDOW`.
 #[derive(Default)]
 struct Limiter {
-    last: Option<Instant>,
+    accepted: std::collections::VecDeque<Instant>,
 }
 
 impl Limiter {
     fn allow(&mut self, now: Instant) -> bool {
-        match self.last {
-            Some(t) if now.saturating_duration_since(t) < MIN_GAP => false,
-            _ => {
-                self.last = Some(now);
-                true
-            }
+        while self
+            .accepted
+            .front()
+            .is_some_and(|&t| now.saturating_duration_since(t) >= BURST_WINDOW)
+        {
+            self.accepted.pop_front();
         }
+        let too_soon = self
+            .accepted
+            .back()
+            .is_some_and(|&t| now.saturating_duration_since(t) < MIN_GAP);
+        if too_soon || self.accepted.len() >= BURST {
+            return false;
+        }
+        self.accepted.push_back(now);
+        true
     }
 }
 
-/// The name of a program for the notification, from its `comm` (at most 15
-/// bytes the program chose itself, so anything at all): letters, digits and a
-/// few marks as they are, every other byte a `?`.
-fn label_from_comm(comm: &[u8]) -> String {
-    let name: String = comm
-        .iter()
-        .take(15)
+/// Letters, digits and a few marks as they are, every other byte a `?`.
+fn plain_name(raw: &[u8], max: usize) -> String {
+    raw.iter()
+        .take(max)
         .take_while(|&&b| b != b'\n' && b != 0)
         .map(|&b| match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'+' | b' ' => b as char,
             _ => '?',
         })
-        .collect();
-    let name = name.trim();
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// The name of a program for the notification. `comm` is at most 15 bytes
+/// the program chose itself (anything at all, and a program can rename
+/// itself), so it is defanged; `exe` is the name of the file it runs, which
+/// it cannot choose: when that file is not what `comm` says, it is added
+/// (`kdeconnect (python3.14)`), so a program cannot pass for another one.
+fn label(comm: &[u8], exe: Option<&[u8]>) -> String {
+    let name = plain_name(comm, 15);
     if name.is_empty() {
-        UNKNOWN.to_string()
-    } else if name == "xdg-dbus-proxy" {
-        SANDBOXED.to_string()
-    } else {
-        name.to_string()
+        return UNKNOWN.to_string();
+    }
+    if name == "xdg-dbus-proxy" {
+        return SANDBOXED.to_string();
+    }
+    let exe = exe
+        .map(|e| e.strip_suffix(b" (deleted)").unwrap_or(e))
+        .map(|e| plain_name(e, 24))
+        .filter(|e| !e.is_empty() && !e.starts_with(&name));
+    match exe {
+        Some(exe) => format!("{name} ({exe})"),
+        None => name,
     }
 }
 
@@ -103,7 +131,12 @@ async fn caller(conn: &zbus::Connection, hdr: &zbus::message::Header<'_>) -> Str
             .ok()?;
         let pid = creds.process_id()?;
         let comm = std::fs::read(format!("/proc/{pid}/comm")).ok()?;
-        Some(label_from_comm(&comm))
+        let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
+        let exe = exe
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.as_bytes());
+        Some(label(&comm, exe))
     };
     who.await.unwrap_or_else(|| UNKNOWN.to_string())
 }
@@ -178,7 +211,7 @@ impl Shared {
             self.running.fetch_sub(1, Ordering::SeqCst);
             self.emit(
                 "ScreenshotFailed",
-                "Screenshots over D-Bus are limited to one every few seconds",
+                "Screenshots over D-Bus are limited: one every few seconds, ten every ten minutes",
             );
             return;
         }
@@ -469,23 +502,38 @@ mod tests {
     }
 
     #[test]
-    fn a_caller_is_named_by_its_comm_and_nothing_else() {
-        assert_eq!(label_from_comm(b"curl\n"), "curl");
-        assert_eq!(label_from_comm(b"gdbus"), "gdbus");
-        assert_eq!(label_from_comm(b"kdeconnectd"), "kdeconnectd");
-        assert_eq!(label_from_comm(b"xdg-dbus-proxy\n"), SANDBOXED);
-        assert_eq!(label_from_comm(b""), UNKNOWN);
-        assert_eq!(label_from_comm(b"\n"), UNKNOWN);
-        assert_eq!(label_from_comm(b"   "), UNKNOWN);
+    fn a_caller_is_named_by_its_comm_and_exe_and_nothing_else() {
+        assert_eq!(label(b"curl\n", None), "curl");
+        assert_eq!(label(b"gdbus", Some(b"gdbus")), "gdbus");
+        assert_eq!(label(b"kdeconnectd", Some(b"kdeconnectd")), "kdeconnectd");
+        // comm is cut at 15 bytes: the longer exe name is the same program.
+        assert_eq!(
+            label(b"kdeconnectd-lon", Some(b"kdeconnectd-long-name")),
+            "kdeconnectd-lon"
+        );
+        assert_eq!(
+            label(b"xdg-dbus-proxy\n", Some(b"xdg-dbus-proxy")),
+            SANDBOXED
+        );
+        assert_eq!(label(b"", None), UNKNOWN);
+        assert_eq!(label(b"\n", None), UNKNOWN);
+        assert_eq!(label(b"   ", None), UNKNOWN);
+        // A program that renamed itself to look like another shows its file.
+        assert_eq!(
+            label(b"kdeconnectd", Some(b"python3.14")),
+            "kdeconnectd (python3.14)"
+        );
+        assert_eq!(label(b"curl", Some(b"evil (deleted)")), "curl (evil)");
         // The program chose its own name: markup, escapes and non-UTF-8 are
         // defanged, and the length is bounded.
-        assert_eq!(label_from_comm(b"<b>x</b>"), "?b?x??b?");
-        assert_eq!(label_from_comm(b"a\x1b[31mred"), "a??31mred");
-        assert_eq!(label_from_comm(&[0xff, 0xfe, b'a']), "??a");
-        assert_eq!(label_from_comm(&[b'x'; 200]).len(), 15);
+        assert_eq!(label(b"<b>x</b>", None), "?b?x??b?");
+        assert_eq!(label(b"a\x1b[31mred", None), "a??31mred");
+        assert_eq!(label(&[0xff, 0xfe, b'a'], None), "??a");
+        assert_eq!(label(&[b'x'; 200], None).len(), 15);
+        assert!(label(&[b'x'; 15], Some(&[b'y'; 300])).len() <= 15 + 3 + 24);
         // And whatever it is, the command line accepts it.
         for comm in [&b"<b>x</b>"[..], &[0xff; 15][..], b"a b", b"--full"] {
-            let label = label_from_comm(comm);
+            let label = label(comm, Some(b"--edit"));
             let args = argv("--full", -1, -1, -1, &label)
                 .into_iter()
                 .map(|s| s.into_string().unwrap());
@@ -509,5 +557,21 @@ mod tests {
         assert!(l.allow(t0 + MIN_GAP * 2));
         // An earlier time (a clock that stepped back) is a refusal, not a panic.
         assert!(!l.allow(t0));
+    }
+
+    #[test]
+    fn a_program_asking_in_a_loop_gets_ten_pictures_then_refusals() {
+        let t0 = Instant::now();
+        let mut l = Limiter::default();
+        let mut taken = 0;
+        // Every 4 seconds for 9 minutes.
+        for i in 0..135u32 {
+            if l.allow(t0 + Duration::from_secs(4) * i) {
+                taken += 1;
+            }
+        }
+        assert_eq!(taken, BURST);
+        // And it can have more once the oldest have left the window.
+        assert!(l.allow(t0 + BURST_WINDOW + Duration::from_secs(1)));
     }
 }

@@ -340,6 +340,53 @@ private slots:
         QVERIFY(shot::decodeFile(u"/tmp"_s, &err).isNull());
     }
 
+    // The cap wrapper must not change what the image plugins read: every
+    // format the editor opens decodes from a file and from a buffer, with the
+    // right size (and, for the lossless ones, the right pixels).
+    void everyAllowedFormatDecodesThroughTheCap_data()
+    {
+        QTest::addColumn<QString>("format");
+        QTest::addColumn<bool>("lossless");
+        QTest::newRow("png") << u"png"_s << true;
+        QTest::newRow("bmp") << u"bmp"_s << true;
+        QTest::newRow("jpeg") << u"jpg"_s << false;
+        QTest::newRow("gif") << u"gif"_s << false;
+        QTest::newRow("webp") << u"webp"_s << false;
+    }
+
+    void everyAllowedFormatDecodesThroughTheCap()
+    {
+        QFETCH(QString, format);
+        QFETCH(bool, lossless);
+        if (!QImageWriter::supportedImageFormats().contains(format.toLatin1()))
+            QSKIP("this Qt build has no writer for the format");
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        QImage in(211, 137, QImage::Format_RGB32);
+        for (int y = 0; y < in.height(); ++y)
+            for (int x = 0; x < in.width(); ++x)
+                in.setPixel(x, y, qRgb((x * 5) % 256, (y * 7) % 256, (x + y) % 256));
+        const QString path = dir.filePath(u"in."_s + format);
+        QVERIFY(in.save(path));
+
+        QString err;
+        const QImage fromFile = shot::decodeFile(path, &err);
+        QVERIFY2(!fromFile.isNull(), qPrintable(err));
+        QCOMPARE(fromFile.size(), in.size());
+        QFile f(path);
+        QVERIFY(f.open(QIODevice::ReadOnly));
+        QByteArray bytes = f.readAll();
+        QBuffer buf(&bytes);
+        buf.open(QIODevice::ReadOnly);
+        const QImage fromBuffer = shot::decodeImage(&buf, &err);
+        QVERIFY2(!fromBuffer.isNull(), qPrintable(err));
+        QCOMPARE(fromBuffer.size(), in.size());
+        if (lossless) {
+            QVERIFY(samePixels(fromFile.convertedTo(QImage::Format_RGB32), in));
+            QVERIFY(samePixels(fromBuffer.convertedTo(QImage::Format_RGB32), in));
+        }
+    }
+
     void pixelBombsAreRefusedOnTheirSize_data()
     {
         QTest::addColumn<quint32>("w");
