@@ -119,11 +119,15 @@ fn toast_hints(image: &Option<Image>) -> HashMap<&'static str, Value<'static>> {
 }
 
 /// Listens for the signals of the notification server. Made before the
-/// notification is sent, so a quick click is not missed.
+/// notification is sent, so a quick click is not missed. The bus only hands
+/// over signals sent by whoever owns the server's name now, so another
+/// program cannot crowd the queue with look-alikes; `next_event` still holds
+/// to the one connection that answered `Notify`.
 pub fn watch(conn: &Connection) -> Result<MessageIterator, String> {
     let rule = zbus::MatchRule::builder()
         .msg_type(zbus::message::Type::Signal)
-        .interface("org.freedesktop.Notifications")
+        .sender(DEST)
+        .and_then(|b| b.interface("org.freedesktop.Notifications"))
         .and_then(|b| b.path(PATH))
         .map(|b| b.build())
         .map_err(|e| e.to_string())?;
@@ -165,6 +169,12 @@ pub fn send_toast(conn: &Connection, toast: &Toast) -> Result<(u32, String), Str
     Ok((id, sender))
 }
 
+/// Whether a signal's sender (the unique name the bus stamped on it, which
+/// cannot be forged) is the connection that answered our `Notify`.
+fn is_from(signal_sender: Option<&str>, server: &str) -> bool {
+    !server.is_empty() && signal_sender == Some(server)
+}
+
 /// What happened to our notification.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Event {
@@ -181,7 +191,7 @@ pub fn next_event(events: &mut MessageIterator, id: u32, sender: &str) -> Option
     for msg in events.by_ref() {
         let Ok(msg) = msg else { continue };
         let header = msg.header();
-        if header.sender().map(|s| s.as_str()) != Some(sender) {
+        if !is_from(header.sender().map(|s| s.as_str()), sender) {
             continue;
         }
         let body = msg.body();
@@ -308,6 +318,19 @@ mod tests {
             Image::Thumb { w, h, .. } => assert_eq!((w, h), (40, 30)),
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn only_the_server_that_answered_is_believed() {
+        assert!(is_from(Some(":1.42"), ":1.42"));
+        // Another program on the bus (or one that took over the name later).
+        assert!(!is_from(Some(":1.43"), ":1.42"));
+        assert!(!is_from(Some(":1.4"), ":1.42"));
+        assert!(!is_from(Some(":1.421"), ":1.42"));
+        assert!(!is_from(Some("org.freedesktop.Notifications"), ":1.42"));
+        assert!(!is_from(None, ":1.42"));
+        assert!(!is_from(None, ""));
+        assert!(!is_from(Some(""), ""));
     }
 
     #[test]

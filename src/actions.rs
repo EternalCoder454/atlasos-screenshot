@@ -20,6 +20,11 @@ pub const DEFAULT: &str = "default";
 
 pub const EDITOR_NAME: &str = "telamon-screenshot-editor";
 
+/// `xdg-open` by its absolute path: a folder earlier in the session's `PATH`
+/// (`~/.local/bin`) must not be able to stand in for it. The package
+/// requires xdg-utils.
+pub const XDG_OPEN: &str = "/usr/bin/xdg-open";
+
 /// What the actions act on.
 #[derive(Debug, Clone)]
 pub struct Ctx {
@@ -79,7 +84,7 @@ pub fn plan(key: &str, ctx: &Ctx) -> Option<Launch> {
         "open" | DEFAULT => {
             let path = ctx.path.as_ref()?;
             Some(Launch::Argv {
-                prog: "xdg-open".into(),
+                prog: XDG_OPEN.into(),
                 args: vec![path.as_os_str().to_owned()],
                 png_on_stdin: false,
             })
@@ -89,7 +94,7 @@ pub fn plan(key: &str, ctx: &Ctx) -> Option<Launch> {
             let dir = path.parent()?;
             Some(Launch::ShowItems {
                 uri: file_uri(path),
-                fallback: vec!["xdg-open".into(), dir.as_os_str().to_owned()],
+                fallback: vec![XDG_OPEN.into(), dir.as_os_str().to_owned()],
             })
         }
         "edit" => Some(match &ctx.path {
@@ -210,11 +215,29 @@ mod tests {
         // A hostile file name is one argument, not a command.
         let p = "/home/z/Pictures/Screenshots/a; rm -rf ~ $(x) `y`.png";
         let (prog, args, stdin) = argv(plan("open", &ctx(Some(p))));
-        assert_eq!(prog, PathBuf::from("xdg-open"));
+        assert_eq!(prog, PathBuf::from("/usr/bin/xdg-open"));
         assert_eq!(args, vec![OsString::from(p)]);
         assert!(!stdin);
         // Clicking the notification itself opens the file too.
         assert_eq!(plan(DEFAULT, &ctx(Some(p))), plan("open", &ctx(Some(p))));
+    }
+
+    #[test]
+    fn nothing_is_looked_up_on_the_path() {
+        // Every program a button starts is an absolute path (the editor and
+        // this program come from the running binary's own folder or
+        // /usr/bin), so the session's PATH decides nothing.
+        let c = ctx(Some("/p/a.png"));
+        for key in ["open", DEFAULT, "edit", "copy"] {
+            let (prog, ..) = argv(plan(key, &c));
+            assert!(prog.is_absolute(), "{key}: {prog:?}");
+        }
+        match plan("folder", &c).unwrap() {
+            Launch::ShowItems { fallback, .. } => {
+                assert!(Path::new(&fallback[0]).is_absolute());
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -226,7 +249,7 @@ mod tests {
                 assert_eq!(
                     fallback,
                     vec![
-                        OsString::from("xdg-open"),
+                        OsString::from("/usr/bin/xdg-open"),
                         OsString::from("/home/z/Pictures/Screenshots")
                     ]
                 );

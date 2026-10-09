@@ -48,7 +48,7 @@ schemes=()
 
 tty=()
 [ -t 0 ] && tty=(-it)
-exec podman run --rm --init "${tty[@]}" --security-opt label=disable \
+exec podman run --rm --init "${tty[@]}" --security-opt label=disable --ulimit core=0 \
     -v "$repo":/src -w /src \
     -v "$work":/work "${schemes[@]}" \
     -e QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}" \

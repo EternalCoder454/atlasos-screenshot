@@ -6,7 +6,7 @@
 %global app_id net.eterneon.telamon.screenshot
 
 Name:           telamon-screenshot
-Version:        0.3.0
+Version:        0.4.0
 Release:        1%{?dist}
 Summary:        Screenshots for Telamon OS: screen, window or region, copied, saved and annotated
 License:        MIT

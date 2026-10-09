@@ -212,12 +212,18 @@ fn save_renamed(
     result
 }
 
+/// The last second `utc_stamp` writes: 9999-12-31 23:59:59. A time past it
+/// (or before 1970) is clamped, so a name is always `YYYYMMDD_HHMMSS`: eight
+/// digits, an underscore, six digits.
+const MAX_STAMP_SECS: i64 = 253_402_300_799;
+
 /// The time on the user's clock (the UTC stamp shifted by the local offset).
 fn local_stamp(t: std::time::SystemTime) -> String {
     let secs = t
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(MAX_STAMP_SECS))
+        .unwrap_or(0)
+        .min(MAX_STAMP_SECS);
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     let now = secs as libc::time_t;
     // SAFETY: localtime_r only writes the `tm` we own.
@@ -226,15 +232,19 @@ fn local_stamp(t: std::time::SystemTime) -> String {
     } else {
         tm.tm_gmtoff
     };
-    utc_stamp(std::time::UNIX_EPOCH + std::time::Duration::from_secs((secs + off).max(0) as u64))
+    utc_stamp(
+        std::time::UNIX_EPOCH
+            + std::time::Duration::from_secs(secs.saturating_add(off).max(0) as u64),
+    )
 }
 
 /// `20261005_174012` (UTC), from the civil-from-days algorithm.
 fn utc_stamp(t: std::time::SystemTime) -> String {
     let secs = t
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(MAX_STAMP_SECS))
+        .unwrap_or(0)
+        .clamp(0, MAX_STAMP_SECS);
     let (days, rem) = (secs.div_euclid(86400), secs.rem_euclid(86400));
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
@@ -262,6 +272,51 @@ mod tests {
         let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_791_250_812);
         assert_eq!(utc_stamp(t), "20261006_014012");
         assert_eq!(utc_stamp(std::time::UNIX_EPOCH), "19700101_000000");
+    }
+
+    #[test]
+    fn stamps_stay_in_shape_at_the_ends_of_time() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let shape = |s: &str| {
+            s.len() == 15
+                && s.as_bytes()[8] == b'_'
+                && s.bytes()
+                    .enumerate()
+                    .all(|(i, b)| i == 8 || b.is_ascii_digit())
+        };
+        for secs in [
+            0,
+            1,
+            951_782_400,
+            253_402_300_799,
+            253_402_300_800,
+            i64::MAX as u64,
+        ] {
+            // (the largest times the platform holds; none may panic)
+            let Some(t) = UNIX_EPOCH.checked_add(Duration::from_secs(secs)) else {
+                continue;
+            };
+            assert!(shape(&utc_stamp(t)), "utc {secs}");
+            assert!(shape(&local_stamp(t)), "local {secs}");
+        }
+        assert_eq!(
+            utc_stamp(UNIX_EPOCH + Duration::from_secs(253_402_300_799)),
+            "99991231_235959"
+        );
+        assert_eq!(
+            utc_stamp(UNIX_EPOCH + Duration::from_secs(253_402_300_800)),
+            "99991231_235959"
+        );
+        // Before 1970 is 1970.
+        assert_eq!(
+            utc_stamp(UNIX_EPOCH - Duration::from_secs(5)),
+            "19700101_000000"
+        );
+        // Leap day.
+        assert_eq!(
+            utc_stamp(UNIX_EPOCH + Duration::from_secs(951_782_400)),
+            "20000229_000000"
+        );
     }
 
     #[test]

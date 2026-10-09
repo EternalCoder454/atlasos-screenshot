@@ -23,6 +23,7 @@ mod clipboard;
 mod config;
 mod countdown;
 mod dbus;
+mod harden;
 mod legacy;
 #[cfg(feature = "ocr")]
 mod models;
@@ -49,6 +50,8 @@ use config::Config;
 use modes::{Kind, Mode};
 
 fn main() -> ExitCode {
+    // The process holds screen contents: a crash must not write them out.
+    harden::no_core_dumps();
     let action = match cli::parse_args(std::env::args().skip(1)) {
         Ok(a) => a,
         Err(e) => {
@@ -229,7 +232,8 @@ fn run(args: &Args, cfg: &Config) -> Result<bool, String> {
         },
         _ => (None, None),
     };
-    let notify = (cfg.output.notify && !args.no_notify) || save_error.is_some();
+    // `--notify` is the D-Bus service's: its captures are never silent.
+    let notify = (cfg.output.notify && !args.no_notify) || args.notify || save_error.is_some();
     let wants_post = edit || notify;
     let keep_png = match &payload {
         Payload::Png(png) if wants_post => Some(png.clone()),
@@ -237,7 +241,12 @@ fn run(args: &Args, cfg: &Config) -> Result<bool, String> {
     };
     let thumb =
         (notify && !edit && keep_png.is_some() && saved.is_none()).then(|| notify::thumb(&crop));
-    let words = words_for(&payload, saved.as_deref(), save_error.as_deref());
+    let words = words_for(
+        &payload,
+        saved.as_deref(),
+        save_error.as_deref(),
+        args.requested_by.as_deref(),
+    );
     drop(crop);
 
     clipboard::copy(payload)?;
@@ -257,12 +266,22 @@ fn run(args: &Args, cfg: &Config) -> Result<bool, String> {
     Ok(true)
 }
 
-/// The notification's title and body.
+/// The notification's title and body; `requested_by` (a program that asked
+/// over D-Bus) is named in the body.
 fn words_for(
     payload: &Payload,
     saved: Option<&Path>,
     save_error: Option<&str>,
+    requested_by: Option<&str>,
 ) -> (String, String) {
+    let (title, mut body) = words(payload, saved, save_error);
+    if let Some(who) = requested_by {
+        body.push_str(&format!("\nRequested by {who} over D-Bus."));
+    }
+    (title, body)
+}
+
+fn words(payload: &Payload, saved: Option<&Path>, save_error: Option<&str>) -> (String, String) {
     match (payload, saved, save_error) {
         (Payload::Text(t), _, _) => (
             "Text Copied".into(),
@@ -519,15 +538,18 @@ mod tests {
     #[test]
     fn notification_words() {
         let png = Payload::Png(vec![]);
-        let (t, b) = words_for(&png, Some(Path::new("/p/Screenshot_1.png")), None);
+        let (t, b) = words_for(&png, Some(Path::new("/p/Screenshot_1.png")), None, None);
         assert_eq!(t, "Screenshot Saved");
         assert!(b.starts_with("Screenshot_1.png"));
-        let (t, b) = words_for(&png, None, Some("no room"));
+        let (t, b) = words_for(&png, None, Some("no room"), None);
         assert_eq!(t, "Screenshot Copied");
         assert!(b.contains("no room"));
-        assert_eq!(words_for(&png, None, None).0, "Screenshot Copied");
-        let (t, b) = words_for(&Payload::Text("héllo".into()), None, None);
+        assert_eq!(words_for(&png, None, None, None).0, "Screenshot Copied");
+        let (t, b) = words_for(&Payload::Text("héllo".into()), None, None, None);
         assert_eq!(t, "Text Copied");
         assert!(b.starts_with("5 characters"));
+        // A capture a program asked for over D-Bus names the program.
+        let (_, b) = words_for(&png, None, None, Some("curl"));
+        assert!(b.ends_with("Requested by curl over D-Bus."));
     }
 }

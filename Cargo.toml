@@ -1,6 +1,6 @@
 [package]
 name = "telamon-screenshot"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Region screenshots to the Wayland clipboard: image, OCR text or redacted image"
@@ -42,6 +42,10 @@ serde = { version = "1.0.229", features = ["derive"] }
 toml = { version = "1.1", default-features = false, features = ["parse", "serde"] }
 
 [profile.release]
+# Secure phase: arithmetic on sizes and offsets that come from KWin, the
+# compositor, files and pipes aborts (panic = "abort", with a notification)
+# instead of wrapping. Its cost is to be measured in the Performant phase.
+overflow-checks = true
 opt-level = 3
 lto = true
 codegen-units = 1
